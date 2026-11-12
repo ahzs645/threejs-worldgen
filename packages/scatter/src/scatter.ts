@@ -661,7 +661,9 @@ function placementKey(l: ScatterLayer): unknown[] {
     l.randomYaw,
     l.tilt,
     l.sink,
-    l.colorVariation
+    l.colorVariation,
+    // A new fixed list regenerates the tiles; keyed by identity, so a large list is never serialised.
+    l.instances ? `instances:${idOf(l.instances)}` : null
   ].map((v) => (v === Infinity ? 'inf' : v === -Infinity ? '-inf' : v))
 }
 

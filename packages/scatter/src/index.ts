@@ -15,7 +15,14 @@ export type {
   ScatterSettings,
   ScatterStats
 } from './scatter.ts'
-export { DEFAULT_PLACEMENT, INSTANCE_STRIDE, clusterFactor, groupSeed, placeTile } from './placement.ts'
+export {
+  DEFAULT_PLACEMENT,
+  FIXED_INSTANCE_STRIDE,
+  INSTANCE_STRIDE,
+  clusterFactor,
+  groupSeed,
+  placeTile
+} from './placement.ts'
 export type { DensityFn, PlacementRules, ScatterCluster } from './placement.ts'
 export { poissonDisk } from './poisson.ts'
 export { selectLod } from './lod.ts'

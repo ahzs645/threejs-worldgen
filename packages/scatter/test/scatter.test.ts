@@ -350,3 +350,42 @@ test('bakeImpostor: the surface carries normal, roughness and mask, and the mate
   assert.equal(impostor.material.roughnessNode, impostor.surface.roughness)
   impostor.dispose()
 })
+
+test('fixed instances: each tile takes the ones inside it, stood on the terrain at their own size', () => {
+  // x, z, yaw, width scale, height scale
+  const instances = new Float32Array([5, 5, 0.5, 3, 20, 25, 12, 0, 4, 30, 35, 5, 0, 2, 10])
+  const slope = (x: number) => x * 0.1
+  const tile = placeTile([layer('stand', { instances })], 0, 0, 30, 9, slope)[0]
+  // The third lies in the next tile.
+  assert.equal(tile.length / INSTANCE_STRIDE, 2)
+  const next = placeTile([layer('stand', { instances })], 30, 0, 30, 9, slope)[0]
+  assert.equal(next.length / INSTANCE_STRIDE, 1)
+  // Translation on the terrain, height scale in y, width scale in x and z.
+  assert.deepEqual(
+    [tile[12], tile[13], tile[14]].map((v) => +v.toFixed(4)),
+    [5, 0.5, 5]
+  )
+  const column = (o: number, c: number) => Math.hypot(tile[o + c * 4], tile[o + c * 4 + 1], tile[o + c * 4 + 2])
+  assert.equal(+column(0, 0).toFixed(4), 3)
+  assert.equal(+column(0, 1).toFixed(4), 20)
+  assert.equal(+column(0, 2).toFixed(4), 3)
+  // Yaw and the height (the impostor's scale) in the trailing params.
+  assert.equal(+tile[16].toFixed(4), 0.5)
+  assert.equal(tile[17], 20)
+})
+
+test('fixed instances: a layer with a list takes no blue-noise points, and the others in its group still do', () => {
+  const instances = new Float32Array([5, 5, 0, 1, 1])
+  const [fixed, scattered] = placeTile(
+    [layer('fixed', { group: 'g', instances }), layer('free', { group: 'g' })],
+    0,
+    0,
+    30,
+    9,
+    flat
+  )
+  assert.equal(fixed.length / INSTANCE_STRIDE, 1)
+  assert.ok(scattered.length / INSTANCE_STRIDE > 50)
+  // Gaps in the terrain drop a fixed instance just as they drop a point.
+  assert.equal(placeTile([layer('fixed', { instances })], 0, 0, 30, 9, () => Number.NaN)[0].length, 0)
+})

@@ -59,7 +59,18 @@ export interface PlacementRules {
    * three.js multiplies in after `colorNode`.
    */
   colorVariation: number
+  /**
+   * Fixed placements instead of blue-noise points: {@link FIXED_INSTANCE_STRIDE} floats per instance —
+   * `x, z, yaw, widthScale, heightScale` — each stood on the terrain at (x, z). For drawing an inventory or any
+   * other existing list of objects (survey trees, mapped boulders) with the scatter's streaming, levels of detail
+   * and impostors. A layer with instances takes no blue-noise points, and its density, slope, height, cluster,
+   * scale and yaw rules do not apply; `sink` and `colorVariation` still do. `null` (the default) scatters as usual.
+   */
+  instances?: Float32Array | null
 }
+
+/** Floats per fixed instance in {@link PlacementRules.instances}: x, z, yaw, width scale, height scale. */
+export const FIXED_INSTANCE_STRIDE = 5
 
 /** Defaults for every {@link PlacementRules} field except `name`. */
 export const DEFAULT_PLACEMENT: Omit<PlacementRules, 'name'> = {
@@ -75,7 +86,8 @@ export const DEFAULT_PLACEMENT: Omit<PlacementRules, 'name'> = {
   randomYaw: true,
   tilt: 0,
   sink: 0,
-  colorVariation: 0
+  colorVariation: 0,
+  instances: null
 }
 
 /**
@@ -118,6 +130,30 @@ export function placeTile(
 ): Float32Array[] {
   const out = layers.map(() => [] as number[])
   if (!layers.length) return out.map(() => new Float32Array(0))
+  // Fixed instances first: the ones inside this tile, stood on the terrain.
+  layers.forEach((l, i) => {
+    const list = l.instances
+    if (!list) return
+    for (let k = 0; k + FIXED_INSTANCE_STRIDE <= list.length; k += FIXED_INSTANCE_STRIDE) {
+      const x = list[k]
+      const z = list[k + 1]
+      if (x < x0 || x >= x0 + size || z < z0 || z >= z0 + size) continue
+      const y = height(x, z)
+      if (y !== y) continue
+      const yaw = list[k + 2]
+      const width = list[k + 3]
+      const tall = list[k + 4]
+      const u = hash(Math.floor(x * 1000), Math.floor(z * 1000), seed) / 4294967296
+      const tint = 1 + (u * 2 - 1) * l.colorVariation
+      _q.setFromAxisAngle(UP, yaw)
+      _m.compose(_p.set(x, y - l.sink, z), _q, _s.set(width, tall, width))
+      const o = out[i]
+      for (let e = 0; e < 16; e++) o.push(_m.elements[e])
+      // Impostors scale uniformly: by the height, which sets their size on screen.
+      o.push(yaw, tall, tint, u)
+    }
+  })
+  if (layers.every((l) => l.instances)) return out.map((a) => new Float32Array(a))
   const points = poissonDisk(x0, z0, size, layers[0].spacing, seed)
   const needNormal = layers.some((l) => l.minSlope > 0 || Number.isFinite(l.maxSlope) || l.align > 0)
   const clusterSeeds = layers.map((l) => hash(seed, hashString(l.name), 7))
@@ -143,7 +179,7 @@ export function placeTile(
     for (let i = 0; i < layers.length; i++) {
       const l = layers[i]
       let d = 0
-      if (slope >= l.minSlope && slope <= l.maxSlope && y >= l.minHeight && y <= l.maxHeight) {
+      if (!l.instances && slope >= l.minSlope && slope <= l.maxSlope && y >= l.minHeight && y <= l.maxHeight) {
         d = typeof l.density === 'number' ? l.density : l.density(x, z)
         if (d > 0 && l.cluster && l.cluster.strength > 0) d *= clusterFactor(l.cluster, x, z, clusterSeeds[i])
       }
