@@ -196,7 +196,9 @@ if (scatter) {
           maxDistance: [100, 2000, 10],
           buildBudget: [0.5, 20, 0.5],
           lodHysteresis: [0, 0.5, 0.01],
-          refreshDistance: [0.1, 20, 0.1]
+          refreshDistance: [0.1, 20, 0.1],
+          cullMargin: [0, 90, 1],
+          cullNear: [0, 200, 1]
         }
       })
     ]

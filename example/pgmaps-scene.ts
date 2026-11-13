@@ -1,48 +1,250 @@
 // A PGMaps forest scene package (https://github.com/ahzs645/PGMaps, src/pages/dev-forestry/scenePackage.ts) drawn
-// with threejs-scatter + threejs-trees: the inventory's own stems, on the package's own ground, from its eye.
+// with threejs-trees, threejs-scatter, threejs-sky, threejs-water and threejs-weathering: the inventory's own stems,
+// on the package's own ground, from its eye, under the sky of a given date and place.
 //   pgmaps-scene.html?scene=<url of a package JSON>   (or pick a file)
-//   add &webgl to force the WebGL2 backend, &noimpostors to skip impostor baking
+//   add &webgl to force the WebGL2 backend, &noimpostors to skip impostor baking, &still to stop on a full frame
+//   environment for standalone tests: &dateTime=2026-01-15T13:00:00-08:00&latitude=54&longitude=-122.6
+//                                      &ground=bare|snow&weather=clear|overcast|rain|snow
+//
+// Embedded (`?embed`, no `?scene`): a parent page drives it by postMessage.
+//   in:  { type: 'pgmaps-scene', scene }            build (or rebuild, in place) from a package
+//        { type: 'pgmaps-camera', position: [x, y, z], bearingDegrees, pitchDegrees, verticalFovDegrees }
+//                                                    package local metres, z up; kept until a scene is ready
+//        { type: 'pgmaps-environment', dateTime, latitude, longitude, ground: 'bare' | 'snow',
+//          weather: 'clear' | 'overcast' | 'rain' | 'snow' }
+//                                                    sun from the date and place (a sun below the horizon lights the
+//                                                    scene as at dusk), ground snow, weather; any field may be left
+//                                                    out. Kept and applied to every later build; never rebuilds.
+//   out: { type: 'pgmaps-engine-hello', engine }    listening, send a scene
+//        { type: 'pgmaps-engine-ready', engine }    first full frame of a (new) scene drawn
+//        { type: 'pgmaps-engine-error', engine, message }
+//        { type: 'pgmaps-engine-stats', engine, drawn, instances, meshes, fps, stems }   about once a second
+// With ?embed the status overlay is hidden and the orbit controls take no pointer input: the parent owns the camera.
 //
 // The package is local metres: x east, y north, z up (heights absolute). three.js here is y up with north at −z,
-// so a package point (x, y, z) is drawn at (x, z, −y).
+// so a package point (x, y, z) is drawn at (x, z, −y). An optional `water` block lists water bodies:
+// `[{ rings: [[[x, y], …], …holes], elevationMeters: number | null }]` (null = the lowest ground on the shore).
 import * as THREE from 'three/webgpu'
+import { pass } from 'three/tsl'
+import { bloom } from 'three/addons/tsl/display/BloomNode.js'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { FIXED_INSTANCE_STRIDE, Scatter, disposeLayers, type ScatterLayer } from 'threejs-scatter'
-import { createVegetationLayers, setTreeEnvironment, species as presets, type TreeParams } from 'threejs-trees'
-import { createEnvironment } from './shared'
+import { Scatter } from 'threejs-scatter'
+import {
+  createAtmosphere,
+  DEFAULT_ENVIRONMENT,
+  environmentFromParams,
+  mergeEnvironment,
+  type EnvironmentInput,
+  type EnvironmentState
+} from './pgmaps-environment'
+import { buildGround, type Ground, type GroundInput } from './pgmaps-ground'
+import { disposeRetiredStands, disposeStandCache, standLayers, type StandInput } from './pgmaps-trees'
 
-type ScenePackage = {
-  format: 'pgmaps-forest-scene'
-  version: 1
-  terrain: {
-    west: number
-    south: number
-    spacing: number
-    columns: number
-    rows: number
-    heights: Array<number | null>
+type ScenePackage = GroundInput &
+  StandInput & {
+    format: 'pgmaps-forest-scene'
+    version: 1
+    origin?: { lng: number; lat: number; elevationMeters?: number }
+    camera: PackageCamera
+    treeRadiusMeters: number
   }
-  trees: { fields: string[]; species: string[]; count: number; data: number[] }
-  species: Record<string, { label: string; crownRatio: number; crownBase: number; broadleaf: boolean }>
-  openings: Array<{ rings: Array<Array<[number, number]>> }>
-  debris: { count: number; data: number[] }
-  roadScars: Array<{ kind: 'cut' | 'fill'; ring: Array<[number, number]> }>
-  camera: {
-    position: [number, number, number]
-    bearingDegrees: number
-    pitchDegrees: number
-    verticalFovDegrees: number
-  }
-  treeRadiusMeters: number
+type PackageCamera = {
+  position: [number, number, number]
+  bearingDegrees: number
+  pitchDegrees: number
+  verticalFovDegrees: number
 }
 
+const ENGINE = 'worldgen'
 const params = new URLSearchParams(location.search)
+const embedded = params.has('embed')
 const hud = document.getElementById('hud')!
+if (embedded) hud.hidden = true
 const status = (text: string) => {
   hud.textContent = text
 }
+const toParent = (message: Record<string, unknown>) => {
+  if (window.parent !== window) window.parent.postMessage({ engine: ENGINE, ...message }, '*')
+}
 
-async function loadScene(): Promise<ScenePackage> {
+// ---------------------------------------------------------------- the renderer, camera and sky: made once
+const renderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: params.has('webgl') })
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5))
+renderer.setSize(innerWidth, innerHeight)
+document.body.appendChild(renderer.domElement)
+await renderer.init()
+
+const scene = new THREE.Scene()
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.3, 8000)
+const controls = new OrbitControls(camera, renderer.domElement)
+if (embedded) controls.enabled = false
+const atmosphere = await createAtmosphere(renderer, scene, camera)
+
+const pipeline = new THREE.RenderPipeline(renderer)
+const color = pass(scene, camera).getTextureNode('output')
+pipeline.outputNode = color.add(bloom(color, 0.08, 0.3, 4)) // subtle: the HDR threshold keeps it to the sun and glints
+
+/** The environment in force: URL parameters, then every `pgmaps-environment` message on top. */
+let environment: EnvironmentState = mergeEnvironment(DEFAULT_ENVIRONMENT, environmentFromParams(params))
+let origin: { lat: number; lng: number } | null = null
+const applyEnvironment = () => {
+  atmosphere.apply(environment, origin)
+  const state = (window as unknown as { pgmaps?: Record<string, unknown> }).pgmaps
+  if (state) state.environment = { ...atmosphere.applied }
+}
+applyEnvironment()
+
+/** Stands the camera at a package eye: position in package metres, bearing clockwise from north, pitch up. */
+function setCamera(eye: PackageCamera) {
+  camera.fov = eye.verticalFovDegrees
+  camera.updateProjectionMatrix()
+  camera.position.set(eye.position[0], eye.position[2], -eye.position[1])
+  const bearing = THREE.MathUtils.degToRad(eye.bearingDegrees)
+  const pitch = THREE.MathUtils.degToRad(eye.pitchDegrees)
+  controls.target
+    .copy(camera.position)
+    .add(
+      new THREE.Vector3(
+        Math.sin(bearing) * Math.cos(pitch),
+        Math.sin(pitch),
+        -Math.cos(bearing) * Math.cos(pitch)
+      ).multiplyScalar(100)
+    )
+  controls.update()
+}
+
+// ---------------------------------------------------------------- one package's ground, slash, water and stand
+type Built = { scatter: Scatter; ground: Ground; stems: number; dispose(): void }
+
+/**
+ * True while impostors bake. The bake binds its atlas as the render target and awaits shader compiles between
+ * passes; a frame drawn in that gap lands in the atlas (the sky and haze baked over every far tree), so the frame
+ * loop draws nothing until it is done.
+ */
+let baking = false
+
+async function build(pkg: ScenePackage): Promise<Built> {
+  if (pkg?.format !== 'pgmaps-forest-scene' || pkg.version !== 1)
+    throw new Error('Not a PGMaps forest scene package (v1).')
+  status('building the ground…')
+  const maxDistance = pkg.treeRadiusMeters + 50
+  const ground = await buildGround(pkg, atmosphere.states, {
+    renderer,
+    camera,
+    sun: atmosphere.sky.sun,
+    treeRadius: pkg.treeRadiusMeters
+  })
+  baking = true
+  const stand = await standLayers(
+    pkg,
+    params.has('noimpostors') ? null : renderer,
+    maxDistance,
+    status,
+    ground.inWater
+  ).finally(() => {
+    baking = false
+  })
+  console.log(`fixed instances: ${stand.stems}`)
+  const scatter = Scatter.create({
+    camera,
+    scene,
+    terrain: (x: number, z: number) => ground.groundAt(x, -z),
+    layers: stand.layers,
+    seed: 1,
+    maxDistance,
+    // Drawn whole for its first frames, so every level of every species gets its pipeline compiled at load rather than
+    // on the first turn of the head (a 0.6 s stall); then culled to the view (CULL_MARGIN, in the frame loop).
+    cullMargin: 0,
+    cullNear: 35
+  })
+  return {
+    scatter,
+    ground,
+    stems: stand.stems,
+    dispose() {
+      scatter.dispose()
+      ground.dispose()
+    }
+  }
+}
+
+/**
+ * Degrees added to each side of the view before stems are left out. A road view sees about a sixth of the circle
+ * around it, and the stand is drawn as meshes out to 190 m; the margin covers a turn of the head between re-sorts.
+ */
+const CULL_MARGIN = 25
+
+// ---------------------------------------------------------------- packages in, one build at a time
+let current: Built | null = null
+let pending: ScenePackage | null = null
+let building = false
+/** The latest camera from the parent, applied once a scene is ready (a package carries its own eye otherwise). */
+let parentCamera: PackageCamera | null = null
+let framesSinceBuild = 0
+let announced = false
+
+async function load(pkg: ScenePackage) {
+  pending = pkg
+  if (building) return
+  building = true
+  try {
+    while (pending) {
+      const next = pending
+      pending = null
+      const built = await build(next)
+      current?.dispose()
+      disposeRetiredStands() // species the new package no longer uses, now nothing draws them
+      current = built
+      scene.add(built.ground.group)
+      atmosphere.setGround((x, z) => built.ground.groundAt(x, -z))
+      const at = next.origin
+      origin = at && Number.isFinite(at.lat) && Number.isFinite(at.lng) ? { lat: at.lat, lng: at.lng } : null
+      setCamera(parentCamera ?? next.camera)
+      framesSinceBuild = 0
+      announced = false
+      Object.assign(window, {
+        pgmaps: {
+          scene,
+          camera,
+          controls,
+          scatter: built.scatter,
+          ground: built.ground,
+          renderer,
+          atmosphere,
+          ready: false
+        }
+      })
+      applyEnvironment()
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    status(`failed: ${message}`)
+    toParent({ type: 'pgmaps-engine-error', message })
+    Object.assign(window, { pgmaps: { ready: true, error: message } })
+  } finally {
+    building = false
+  }
+}
+
+addEventListener('message', (event: MessageEvent) => {
+  const data = event.data as { type?: string; scene?: ScenePackage } & Partial<PackageCamera> & EnvironmentInput
+  if (data?.type === 'pgmaps-scene' && data.scene) void load(data.scene)
+  else if (data?.type === 'pgmaps-camera' && data.position) {
+    parentCamera = {
+      position: data.position,
+      bearingDegrees: data.bearingDegrees ?? 0,
+      pitchDegrees: data.pitchDegrees ?? 0,
+      verticalFovDegrees: data.verticalFovDegrees ?? camera.fov
+    }
+    if (current) setCamera(parentCamera)
+  } else if (data?.type === 'pgmaps-environment') {
+    // Light, sky and weather only: the stand and ground stay as built.
+    environment = mergeEnvironment(environment, data)
+    applyEnvironment()
+  }
+})
+
+async function fromUrlOrFile(): Promise<ScenePackage> {
   const url = params.get('scene')
   if (url) return (await fetch(url)).json()
   status('choose a PGMaps scene package (forestry-scene-package.json)')
@@ -53,263 +255,90 @@ async function loadScene(): Promise<ScenePackage> {
   })
 }
 
-const scenePackage = await loadScene()
-if (scenePackage.format !== 'pgmaps-forest-scene' || scenePackage.version !== 1)
-  throw new Error('Not a PGMaps forest scene package (v1).')
-status('building the ground…')
-
-// ---------------------------------------------------------------- ground
-const { west, south, spacing, columns, rows } = scenePackage.terrain
-// Gaps (no source DEM there) take the nearest known height along their row, then their column, so the mesh stays
-// whole; the trees and the eye are all inside the known area.
-const heights = scenePackage.terrain.heights.slice()
-const fill = (index: (i: number, j: number) => number, outer: number, inner: number) => {
-  for (let i = 0; i < outer; i++) {
-    let last: number | null = null
-    for (let j = 0; j < inner; j++) last = heights[index(i, j)] ?? last ?? null
-    for (let j = inner - 1; j >= 0; j--) {
-      const k = index(i, j)
-      if (heights[k] === null) heights[k] = last
-      else last = heights[k]
-    }
-  }
-}
-fill((r, c) => r * columns + c, rows, columns)
-fill((c, r) => r * columns + c, columns, rows)
-// A loop, not Math.min(...): spreading a 160,000-cell grid overflows the call stack.
-let base = Infinity
-for (const h of heights) if (h !== null && h < base) base = h
-const at = (column: number, row: number) => heights[row * columns + column] ?? base
-
-/** Ground height at a package point (x east, y north), bilinear. */
-function groundAt(x: number, y: number): number {
-  const gx = Math.min(columns - 1.0001, Math.max(0, (x - west) / spacing))
-  const gy = Math.min(rows - 1.0001, Math.max(0, (y - south) / spacing))
-  const x0 = Math.floor(gx)
-  const y0 = Math.floor(gy)
-  const fx = gx - x0
-  const fy = gy - y0
-  return (
-    at(x0, y0) * (1 - fx) * (1 - fy) +
-    at(x0 + 1, y0) * fx * (1 - fy) +
-    at(x0, y0 + 1) * (1 - fx) * fy +
-    at(x0 + 1, y0 + 1) * fx * fy
-  )
-}
-/** The scatter's terrain: three.js (x, z) is package (x, −z). */
-const height = (x: number, z: number) => groundAt(x, -z)
-
-function inRing(ring: Array<[number, number]>, x: number, y: number) {
-  let inside = false
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [xi, yi] = ring[i]
-    const [xj, yj] = ring[j]
-    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside
-  }
-  return inside
-}
-const cut = (x: number, y: number) =>
-  scenePackage.openings.some((o) => inRing(o.rings[0], x, y) && !o.rings.slice(1).some((r) => inRing(r, x, y)))
-const scar = (x: number, y: number) => scenePackage.roadScars.some((s) => inRing(s.ring, x, y))
-
-// A finer mesh near the eye, where the ground is read most closely.
-function groundMesh(size: number, step: number) {
-  const n = Math.round(size / step)
-  const geometry = new THREE.PlaneGeometry(size, size, n, n).rotateX(-Math.PI / 2)
-  const position = geometry.attributes.position
-  const colors = new Float32Array(position.count * 3)
-  const floor = new THREE.Color('#3f4f33')
-  const soil = new THREE.Color('#9c8664')
-  const bank = new THREE.Color('#b5a585')
-  for (let i = 0; i < position.count; i++) {
-    const x = position.getX(i)
-    const y = -position.getZ(i)
-    position.setY(i, groundAt(x, y))
-    ;(cut(x, y) ? soil : scar(x, y) ? bank : floor).toArray(colors, i * 3)
-  }
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-  geometry.computeVertexNormals()
-  return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }))
-}
-
-const renderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: params.has('webgl') })
-renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5))
-renderer.setSize(innerWidth, innerHeight)
-document.body.appendChild(renderer.domElement)
-await renderer.init()
-
-const scene = new THREE.Scene()
-const { camera: eye } = scenePackage
-const camera = new THREE.PerspectiveCamera(eye.verticalFovDegrees, innerWidth / innerHeight, 0.3, 8000)
-camera.position.set(eye.position[0], eye.position[2], -eye.position[1])
-const bearing = THREE.MathUtils.degToRad(eye.bearingDegrees)
-const pitch = THREE.MathUtils.degToRad(eye.pitchDegrees)
-const target = camera.position
-  .clone()
-  .add(
-    new THREE.Vector3(
-      Math.sin(bearing) * Math.cos(pitch),
-      Math.sin(pitch),
-      -Math.cos(bearing) * Math.cos(pitch)
-    ).multiplyScalar(100)
-  )
-const controls = new OrbitControls(camera, renderer.domElement)
-controls.target.copy(target)
-controls.update()
-const env = createEnvironment(renderer, scene, camera)
-// The demo's haze is a scenic choice (about 70% at 400 m). A visual impact assessment wants the haze of a clear
-// day, which is what PGMaps draws (Koschmieder's law at 60 km visibility); `&haze=` overrides the density.
-scene.fog = new THREE.FogExp2(
-  scene.fog instanceof THREE.FogExp2 ? scene.fog.color : '#aebfcc',
-  Number(params.get('haze') ?? 0.00025)
-)
-
-const near = groundMesh(1400, 5)
-const far = groundMesh(Math.min(columns, rows) * spacing - spacing, spacing * 2)
-far.position.y = -0.3 // under the near mesh where they overlap
-near.receiveShadow = far.receiveShadow = true
-scene.add(near, far)
-
-// ---------------------------------------------------------------- trees
-// PGMaps' species on worldgen's presets: the nearest preset, with the crown base PGMaps draws, so a stem's live
-// crown starts where it does in the road view. Width and height are then each stem's own, per instance.
-const recipe: Record<string, { preset: keyof typeof presets; params?: Partial<TreeParams> }> = {
-  pine: { preset: 'pine' },
-  spruce: { preset: 'spruce' },
-  fir: { preset: 'fir' },
-  douglasFir: {
-    preset: 'fir',
-    params: { crownShape: 'ellipsoid', tropism: [0, 0.02, 0], jitter: 0.25, leafColor: '#30513a' }
-  },
-  aspen: { preset: 'birch', params: { barkColor: '#cfd2c3', leafColor: '#6d8f3c' } },
-  birch: { preset: 'birch' }
-}
-const treeSpecies = scenePackage.trees.species
-const used = treeSpecies.filter((_, index) => {
-  for (let i = 0; i < scenePackage.trees.count; i++) if (scenePackage.trees.data[i * 7 + 3] === index) return true
-  return false
+Object.assign(window, {
+  pgmaps: { scene, camera, controls, renderer, atmosphere, ready: false, environment: { ...atmosphere.applied } }
 })
-const variants = 3
-status(`generating ${used.length} species × ${variants} variants…`)
-const layers: ScatterLayer[] = (await createVegetationLayers({
-  species: used.map((name) => {
-    const { preset, params: extra } = recipe[name] ?? { preset: 'spruce' as const }
-    const p = presets[preset] as TreeParams
-    const crownBase = scenePackage.species[name]?.crownBase ?? 0.3
-    return {
-      name,
-      density: 0,
-      params: { ...p, ...extra, trunkHeight: p.height * crownBase, crownHeight: p.height * (1 - crownBase) }
-    }
-  }),
-  variants,
-  seed: 7,
-  renderer: params.has('noimpostors') ? null : renderer,
-  castShadow: true
-})) as ScatterLayer[]
-
-// Each species' stems, shared out among its variants and scaled from each variant's own size to the stem's height
-// and crown width: the same stems, heights and crowns the road view draws.
-const stride = scenePackage.trees.fields.length
-for (const layer of layers) {
-  const [name, variant] = layer.name.split('#')
-  const speciesIndex = treeSpecies.indexOf(name)
-  const box = new THREE.Box3().setFromBufferAttribute(
-    layer.lods[0].geometry.attributes.position as THREE.BufferAttribute
-  )
-  const tall = box.max.y
-  const wide = Math.max(box.max.x - box.min.x, box.max.z - box.min.z)
-  const list: number[] = []
-  for (let i = 0; i < scenePackage.trees.count; i++) {
-    const o = i * stride
-    if (scenePackage.trees.data[o + 3] !== speciesIndex) continue
-    // A stable variant per stem, from its position.
-    const pick =
-      Math.abs(Math.floor(scenePackage.trees.data[o] * 7.3 + scenePackage.trees.data[o + 1] * 3.1)) % variants
-    if (pick !== Number(variant)) continue
-    const yaw = (scenePackage.trees.data[o + 6] * 6.283185) % 6.283185
-    list.push(
-      scenePackage.trees.data[o],
-      -scenePackage.trees.data[o + 1],
-      yaw,
-      scenePackage.trees.data[o + 5] / wide,
-      scenePackage.trees.data[o + 4] / tall
-    )
-  }
-  layer.instances = new Float32Array(list)
-  layer.colorVariation = 0.1
-  if (list.length === 0) layer.lods = layer.lods.slice(0, 1)
+if (embedded && !params.get('scene')) {
+  status('waiting for a scene from the parent page…')
+  toParent({ type: 'pgmaps-engine-hello' })
+} else {
+  fromUrlOrFile()
+    .then(load)
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      status(`failed: ${message}`)
+      toParent({ type: 'pgmaps-engine-error', message })
+    })
 }
-console.log(`fixed instances: ${layers.reduce((n, l) => n + (l.instances?.length ?? 0) / FIXED_INSTANCE_STRIDE, 0)}`)
 
-const scatter = Scatter.create({
-  camera,
-  scene,
-  terrain: height,
-  layers,
-  seed: 1,
-  maxDistance: scenePackage.treeRadiusMeters + 50
-})
-
-// ---------------------------------------------------------------- slash
-// Logs lying on the cut ground, as PGMaps draws its piles: a few per pile, any direction.
-const logs: THREE.Matrix4[] = []
-const m = new THREE.Matrix4()
-for (let i = 0; i < scenePackage.debris.count; i++) {
-  const [x, y, , footprint] = scenePackage.debris.data.slice(i * 4, i * 4 + 4)
-  for (let k = 0; k < 6; k++) {
-    const a = (i * 7 + k * 13) % 17
-    const px = x + ((a / 17 - 0.5) * footprint) / 2
-    const py = y + ((((a * 5) % 17) / 17 - 0.5) * footprint) / 2
-    const length = footprint * (0.25 + (((a * 3) % 17) / 17) * 0.35)
-    m.compose(
-      new THREE.Vector3(px, groundAt(px, py) + 0.1, -py),
-      new THREE.Quaternion().setFromEuler(new THREE.Euler(0, (a / 17) * Math.PI * 2, Math.PI / 2)),
-      new THREE.Vector3(1, length, 1)
-    )
-    logs.push(m.clone())
-  }
-}
-const logMesh = new THREE.InstancedMesh(
-  new THREE.CylinderGeometry(0.12, 0.15, 1, 6),
-  new THREE.MeshStandardMaterial({ color: '#6f6150', roughness: 1 }),
-  logs.length
-)
-logs.forEach((matrix, i) => {
-  logMesh.setMatrixAt(i, matrix)
-})
-logMesh.castShadow = logMesh.receiveShadow = true
-scene.add(logMesh)
-
-setTreeEnvironment({ windStrength: 0.15 })
-let frames = 0
+// ---------------------------------------------------------------- the frame
 let last = performance.now()
 let fps = 30
-Object.assign(window, { pgmaps: { scene, camera, scatter, ready: false } })
+let lastStats = 0
+const start = performance.now()
+const follow = new THREE.Vector3()
+const ahead = new THREE.Vector3()
+const frustum = new THREE.Frustum()
+const viewProjection = new THREE.Matrix4()
 renderer.setAnimationLoop(() => {
   const now = performance.now()
   fps = fps * 0.9 + (1000 / Math.max(1, now - last)) * 0.1
   last = now
   controls.update()
-  env.follow(controls.target)
-  setTreeEnvironment({ sun: env.sun })
-  scatter.update()
-  env.render()
-  const s = scatter.stats
+  // Shadows centre a little ahead of the eye, along the ground: the eye's own surroundings, not the far target.
+  camera.getWorldDirection(ahead).setY(0)
+  if (ahead.lengthSq() < 1e-6) ahead.set(0, 0, -1)
+  follow.copy(camera.position).addScaledVector(ahead.normalize(), 30)
+  if (baking) return
+  atmosphere.update((now - start) / 1000, follow)
+  if (current) {
+    current.scatter.update()
+    const water = current.ground.water
+    if (water) {
+      water.lakes.update()
+      // The water's reflections need the scene's depth from a prepass: only drawn while the water is in view.
+      camera.updateMatrixWorld()
+      viewProjection.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+      frustum.setFromProjectionMatrix(viewProjection, camera.coordinateSystem)
+      if (frustum.intersectsBox(water.box)) water.prepass.update(renderer, scene)
+    }
+  }
+  pipeline.render()
+  if (!current) return
+  const s = current.scatter.stats
   status(
-    `${fps.toFixed(0)} fps · ${scenePackage.trees.count} stems in the package · instances ${s.instances} · drawn ${s.visible} · meshes ${s.meshes}`
+    `${fps.toFixed(0)} fps · ${current.stems} stems in the package · instances ${s.instances} · drawn ${s.visible} · meshes ${s.meshes}`
   )
+  framesSinceBuild += 1
+  if (framesSinceBuild === 3) current.scatter.set({ cullMargin: CULL_MARGIN })
+  const state = (window as unknown as { pgmaps: { ready: boolean } }).pgmaps
+  const streamed = s.instances >= current.stems
+  // A (new) scene's first full frame: every stem streamed in, or long enough that the rest are out of reach.
+  if (!announced && framesSinceBuild > 2 && (streamed || framesSinceBuild > 120)) {
+    announced = true
+    toParent({ type: 'pgmaps-engine-ready' })
+  }
+  if (now - lastStats > 1000) {
+    lastStats = now
+    toParent({
+      type: 'pgmaps-engine-stats',
+      drawn: s.visible,
+      instances: s.instances,
+      meshes: s.meshes,
+      fps: Math.round(fps),
+      stems: current.stems
+    })
+  }
   // `&still`: once the stand has streamed in, stop on that frame (for screenshots and comparisons).
-  frames += 1
-  if (params.has('still') && frames > 4 && s.instances >= scenePackage.trees.count) {
+  if (params.has('still') && framesSinceBuild > 4 && streamed) {
     renderer.setAnimationLoop(null)
-    ;(window as unknown as { pgmaps: { ready: boolean } }).pgmaps.ready = true
-  } else if (!params.has('still') && frames === 60)
-    (window as unknown as { pgmaps: { ready: boolean } }).pgmaps.ready = true
+    state.ready = true
+  } else if (!params.has('still') && framesSinceBuild === 60) state.ready = true
 })
 addEventListener('beforeunload', () => {
-  scatter.dispose()
-  disposeLayers(layers)
+  current?.dispose()
+  disposeStandCache()
+  atmosphere.dispose()
 })
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight

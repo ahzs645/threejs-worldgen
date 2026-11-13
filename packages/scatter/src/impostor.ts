@@ -334,8 +334,9 @@ function basisNode(d: any) {
 }
 
 /**
- * The impostor material. Per instance it reads `scatterPosition` (xyz = world base position, w = uniform scale) and
- * `scatterParams` (x = yaw in radians, y = brightness tint), which `Scatter` fills for impostor LODs.
+ * The impostor material. Per instance it reads `scatterPosition` (xyz = world base position, w = scale) and
+ * `scatterParams` (x = yaw in radians, y = brightness tint, w = width ÷ height, 1 for a uniform scale), which
+ * `Scatter` fills for impostor LODs.
  */
 function createImpostorMaterial(albedo: Texture, normals: Texture, o: ImpostorOptions, bounds: Sphere) {
   const billboard = o.mode === 'billboard'
@@ -348,7 +349,11 @@ function createImpostorMaterial(albedo: Texture, normals: Texture, o: ImpostorOp
   const rot = (v: any) => vec3(v.x.mul(c).add(v.z.mul(s)), v.y, v.z.mul(c).sub(v.x.mul(s)))
   const unrot = (v: any) => vec3(v.x.mul(c).sub(v.z.mul(s)), v.y, v.z.mul(c).add(v.x.mul(s)))
 
-  const center = aPos.xyz.add(rot(vec3(bounds.center.x, bounds.center.y, bounds.center.z).mul(aPos.w)))
+  // Across (x, z) the instance may be scaled apart from its height: `scatterParams.w` is width ÷ height (1, or 0
+  // from an older writer, for a uniform scale).
+  const across = aPos.w.mul(select(aPar.w.greaterThan(0), aPar.w, float(1)))
+  const scaled = (v: any) => vec3(v.x.mul(across), v.y.mul(aPos.w), v.z.mul(across))
+  const center = aPos.xyz.add(scaled(rot(vec3(bounds.center.x, bounds.center.y, bounds.center.z))))
   const toCamRaw = cameraPosition.sub(center)
   const toCam = billboard ? normalize(vec3(toCamRaw.x, 0, toCamRaw.z).add(vec3(0, 0, 1e-5))) : normalize(toCamRaw)
   const view = basisNode(toCam)
@@ -365,11 +370,15 @@ function createImpostorMaterial(albedo: Texture, normals: Texture, o: ImpostorOp
   const material = new MeshStandardNodeMaterial({ roughness: 0.85, metalness: 0 })
   material.alphaTest = o.alphaTest
   material.positionNode = center.add(
-    view.right.mul(positionGeometry.x).add(view.up.mul(positionGeometry.y)).mul(bounds.radius).mul(aPos.w)
+    scaled(view.right.mul(positionGeometry.x).add(view.up.mul(positionGeometry.y)).mul(bounds.radius))
   )
 
   const inset = 0.5 / Math.max(1, o.size / N)
-  const atlasUv = vCell.add(clamp(uv() as any, inset, 1 - inset)).div(N)
+  // The bake stacks cells bottom-up in NDC (cell row j from the frustum's bottom), but three.js samples a render
+  // target top-down on both backends (WebGL flips render-target UVs to match WebGPU), so the atlas row is read from
+  // the top: without the flip every impostor was drawn upside down (trunks above, crowns hanging under them).
+  const cellUv = vCell.add(clamp(uv() as any, inset, 1 - inset)).div(N)
+  const atlasUv = vec2(cellUv.x, float(1).sub(cellUv.y))
   const sample = texture(albedo, atlasUv)
   const normalSample = texture(normals, atlasUv)
   // The bake stores object-space normals; yaw is the only instance rotation, so turning it by yaw gives the world

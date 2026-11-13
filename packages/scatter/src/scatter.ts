@@ -44,7 +44,7 @@ export interface ScatterLayer extends PlacementRules {
   /**
    * Far level drawn after the last mesh level, typically from `bakeImpostor()`. Unlike mesh levels it is not an
    * `InstancedMesh`: its material reads two per-instance attributes, `scatterPosition` (xyz = base position,
-   * w = scale) and `scatterParams` (x = yaw, y = brightness tint, z = random 0..1).
+   * w = scale) and `scatterParams` (x = yaw, y = brightness tint, z = random 0..1, w = width ÷ height).
    */
   impostor: ScatterLOD | null
   /** Whether instances cast shadows (can be overridden per level). */
@@ -70,6 +70,16 @@ export interface ScatterSettings {
   lodHysteresis: number
   /** How far (metres) the camera moves before instances are re-sorted into levels of detail. */
   refreshDistance: number
+  /**
+   * View culling, off at 0: instances outside the camera's horizontal field of view widened by this many degrees on
+   * each side are left out of the pools (and so of every draw and shadow pass), except within
+   * {@link ScatterSettings.cullNear} of the camera. Instances are re-sorted whenever the view turns by half this
+   * margin, so a margin of 20–30° keeps the edges filled while panning. Turned off while the camera looks steeply up
+   * or down, where a horizontal cone no longer matches the view.
+   */
+  cullMargin: number
+  /** Metres around the camera kept whatever the view direction (shadow casters behind the eye), with culling on. */
+  cullNear: number
   /** The kinds of objects to scatter. */
   layers: ScatterLayer[]
 }
@@ -126,7 +136,9 @@ const DEFAULTS: Omit<ScatterSettings, 'layers'> = {
   maxDistance: 600,
   buildBudget: 4,
   lodHysteresis: 0.1,
-  refreshDistance: 1
+  refreshDistance: 1,
+  cullMargin: 0,
+  cullNear: 30
 }
 
 const LAYER_DEFAULTS: Omit<ScatterLayer, 'name'> = {
@@ -211,6 +223,9 @@ export class Scatter {
   private frame = 0
   private dirty = true
   private lastRefresh = new Vector3(Infinity, 0, 0)
+  /** Horizontal view direction and field of view at the last refresh (view culling). */
+  private lastView = new Vector3(0, 0, 0)
+  private lastFov = 0
   private unhook = () => {}
 
   /** Creates a scatter and generates every tile in range, so the first frame is complete. */
@@ -370,7 +385,36 @@ export class Scatter {
       if (performance.now() - start > budget) break
     }
 
-    if (this.dirty || cam.distanceToSquared(this.lastRefresh) > s.refreshDistance * s.refreshDistance) this.refresh(cam)
+    if (
+      this.dirty ||
+      cam.distanceToSquared(this.lastRefresh) > s.refreshDistance * s.refreshDistance ||
+      this.viewTurned()
+    )
+      this.refresh(cam)
+  }
+
+  /** The view cone for culling: horizontal direction (x, z), cosine of the kept half-angle, or null for no culling. */
+  private viewCone(): { x: number; z: number; cos: number; fov: number } | null {
+    const margin = this.settings.cullMargin
+    if (!(margin > 0)) return null
+    const cam = this.camera as Camera & { fov?: number; aspect?: number; isPerspectiveCamera?: boolean }
+    if (!cam.isPerspectiveCamera || cam.fov === undefined) return null
+    const d = cam.getWorldDirection(_dir)
+    const flat = Math.hypot(d.x, d.z)
+    if (flat < 0.5) return null // looking steeply up or down
+    const half = Math.atan(Math.tan(((cam.fov / 2) * Math.PI) / 180) * (cam.aspect ?? 1))
+    const angle = half + (margin * Math.PI) / 180
+    if (angle >= Math.PI) return null
+    return { x: d.x / flat, z: d.z / flat, cos: Math.cos(angle), fov: cam.fov * (cam.aspect ?? 1) }
+  }
+
+  /** Whether the view has turned (or zoomed out) enough since the last refresh that the culled set must change. */
+  private viewTurned(): boolean {
+    const cone = this.viewCone()
+    if (!cone) return this.lastFov !== 0 // culling just switched off: draw everything again
+    if (this.lastFov === 0) return true
+    const turn = Math.acos(Math.max(-1, Math.min(1, cone.x * this.lastView.x + cone.z * this.lastView.z)))
+    return turn > (this.settings.cullMargin * Math.PI) / 360 || cone.fov > this.lastFov * 1.02
   }
 
   /**
@@ -439,6 +483,21 @@ export class Scatter {
     const s = this.settings
     this.lastRefresh.copy(cam)
     this.dirty = false
+    const cone = this.viewCone()
+    this.lastView.set(cone?.x ?? 0, 0, cone?.z ?? 0)
+    this.lastFov = cone?.fov ?? 0
+    const near2 = s.cullNear * s.cullNear
+    /** Whether the instance at offset `o` is inside the view cone (always, without culling). */
+    const inView = cone
+      ? (data: Float32Array, o: number) => {
+          const dx = data[o + 12] - cam.x
+          const dz = data[o + 14] - cam.z
+          const d2 = dx * dx + dz * dz
+          if (d2 < near2) return true
+          const along = dx * cone.x + dz * cone.z
+          return along > 0 && along * along >= cone.cos * cone.cos * d2
+        }
+      : () => true
     const layerDistances = s.layers.map(distancesOf)
     const counts = s.layers.map((_, i) => new Int32Array(layerDistances[i].length))
     let instances = 0
@@ -458,7 +517,7 @@ export class Scatter {
             const d = Math.hypot(data[o + 12] - cam.x, data[o + 13] - cam.y, data[o + 14] - cam.z)
             const level = selectLod(d, dists, lod[n], s.lodHysteresis)
             lod[n] = level
-            if (level >= 0) c[level]++
+            if (level >= 0 && inView(data, o)) c[level]++
           }
         })
       }
@@ -484,7 +543,8 @@ export class Scatter {
           const data = tg.data[k]
           const lod = tg.lod[k]
           const w = writers[li]
-          for (let n = 0, o = 0; n < lod.length; n++, o += INSTANCE_STRIDE) if (lod[n] >= 0) w[lod[n]]?.(data, o)
+          for (let n = 0, o = 0; n < lod.length; n++, o += INSTANCE_STRIDE)
+            if (lod[n] >= 0 && inView(data, o)) w[lod[n]]?.(data, o)
         })
       }
     }
@@ -595,6 +655,11 @@ function writer(pool: Pool): PoolWriter {
       par[w] = data[o + 16]
       par[w + 1] = data[o + 18]
       par[w + 2] = data[o + 19]
+      // Width over height from the instance matrix (1 for a uniform scale): fixed instances carry their own crown
+      // width, and the impostor stretches across by it so it keeps the mesh's proportions.
+      const across = Math.hypot(data[o], data[o + 1], data[o + 2])
+      const up = Math.hypot(data[o + 4], data[o + 5], data[o + 6])
+      par[w + 3] = up > 0 ? across / up : 1
     }
   }
   const mesh = pool.meshes[0] as InstancedMesh
@@ -708,6 +773,7 @@ export function disposeLayers(layers: readonly Pick<ScatterLayer, 'lods' | 'impo
 }
 
 const _v = new Vector3()
+const _dir = new Vector3()
 
 /**
  * Minimum instances per pooled mesh. three.js draws instanced meshes whose matrices fit a uniform buffer (64 KB on

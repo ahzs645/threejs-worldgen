@@ -81,6 +81,8 @@ function, and `ref` gives you the `ScatterImpl` instance (for `query` and `stats
 | `buildBudget` | `4` | Milliseconds per frame for generating tiles, nearest first. |
 | `lodHysteresis` | `0.1` | Fractional band an instance must cross to switch level. |
 | `refreshDistance` | `1` | Camera movement (m) that re-sorts instances into levels. |
+| `cullMargin` | `0` | View culling, off at 0: degrees added to each side of the camera's horizontal field of view; instances outside are not drawn (nor cast shadows), and instances are re-sorted when the view turns by half the margin. |
+| `cullNear` | `30` | Metres around the camera kept in every direction while culling (shadow casters behind the eye). |
 | `layers` | `[]` | `ScatterLayer[]`, below. |
 
 Layer fields (all but `name` have defaults):
