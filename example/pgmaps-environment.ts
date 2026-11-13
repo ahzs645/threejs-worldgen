@@ -20,12 +20,18 @@ import {
   uniform,
   vec3
 } from 'three/tsl'
-import { Sky, sunElevationAt, toSimTime } from 'threejs-sky'
+import { observe, Sky, sunElevationAt, toSimTime } from 'threejs-sky'
 import { setTreeEnvironment } from 'threejs-trees'
 import { createMaterialStateUniforms, Precipitation, Weather, type MaterialStateUniforms } from 'threejs-weathering'
 
 export type GroundCover = 'bare' | 'snow'
 export type WeatherKind = 'clear' | 'overcast' | 'rain' | 'snow'
+/**
+ * `'daylight'`: a sun below {@link DUSK_ELEVATION} moves the clock to the nearest dusk or dawn, so night is never black.
+ * `'true'`: the sky and the light are the real sun's at that instant; below the horizon there is no direct sun and the
+ * scene may be dark.
+ */
+export type SunMode = 'true' | 'daylight'
 
 /** What the parent sends (`pgmaps-environment`), all optional; missing fields keep their last value. */
 export interface EnvironmentInput {
@@ -35,6 +41,17 @@ export interface EnvironmentInput {
   longitude?: number | null
   ground?: GroundCover
   weather?: WeatherKind
+  /** IANA zone of the place, e.g. `America/Vancouver` (reported with the instant drawn). */
+  timeZone?: string | null
+  /** The instant as an ISO UTC string, e.g. `2026-01-20T23:30:00.000Z`; preferred over `dateTime` when present. */
+  utc?: string | null
+  /** See {@link SunMode}; never sent = `'daylight'`. */
+  sun?: SunMode
+  /**
+   * The parent's own sun for that instant and place (NOAA's equations). The sky's clock is nudged by the minute or two
+   * it takes for its ephemeris to stand the sun at this elevation, so engines light the same moment alike.
+   */
+  sunPosition?: { elevationDegrees: number; azimuthDegrees: number } | null
 }
 
 /** The environment in force: `null` date or position means "the package's default". */
@@ -44,6 +61,10 @@ export interface EnvironmentState {
   longitude: number | null
   ground: GroundCover
   weather: WeatherKind
+  timeZone: string | null
+  utc: string | null
+  sun: SunMode
+  sunPosition: { elevationDegrees: number; azimuthDegrees: number } | null
 }
 
 export const DEFAULT_ENVIRONMENT: EnvironmentState = {
@@ -51,9 +72,22 @@ export const DEFAULT_ENVIRONMENT: EnvironmentState = {
   latitude: null,
   longitude: null,
   ground: 'bare',
-  weather: 'clear'
+  weather: 'clear',
+  timeZone: null,
+  utc: null,
+  sun: 'daylight',
+  sunPosition: null
 }
 
+const SUN_MODES: readonly SunMode[] = ['true', 'daylight']
+const validZone = (zone: string) => {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: zone })
+    return true
+  } catch {
+    return false
+  }
+}
 const GROUNDS: readonly GroundCover[] = ['bare', 'snow']
 const WEATHERS: readonly WeatherKind[] = ['clear', 'overcast', 'rain', 'snow']
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
@@ -67,10 +101,22 @@ export function mergeEnvironment(state: EnvironmentState, input: EnvironmentInpu
   if (finite(input.longitude)) next.longitude = ((((input.longitude + 180) % 360) + 360) % 360) - 180
   if (input.ground && GROUNDS.includes(input.ground)) next.ground = input.ground
   if (input.weather && WEATHERS.includes(input.weather)) next.weather = input.weather
+  // The instant: `utc` when it is sent, else `dateTime`. A message that gives only `dateTime` clears an earlier `utc`,
+  // so the instant drawn is always the one last sent.
+  if (typeof input.utc === 'string' && Number.isFinite(Date.parse(input.utc))) next.utc = input.utc
+  else if (input.utc === null || input.dateTime !== undefined) next.utc = null
+  if (typeof input.timeZone === 'string' && validZone(input.timeZone)) next.timeZone = input.timeZone
+  else if (input.timeZone === null) next.timeZone = null
+  if (input.sun && SUN_MODES.includes(input.sun)) next.sun = input.sun
+  // The parent's sun goes with the instant it was sent with: any new instant without one drops the old one.
+  const given = input.sunPosition
+  if (given && finite(given.elevationDegrees) && finite(given.azimuthDegrees))
+    next.sunPosition = { elevationDegrees: given.elevationDegrees, azimuthDegrees: given.azimuthDegrees }
+  else if (given === null || input.utc !== undefined || input.dateTime !== undefined) next.sunPosition = null
   return next
 }
 
-/** `?dateTime=…&latitude=…&longitude=…&ground=snow&weather=rain`, for standalone tests. */
+/** `?dateTime=…&latitude=…&longitude=…&ground=snow&weather=rain&utc=…&timeZone=…&sun=true`, for standalone tests. */
 export function environmentFromParams(params: URLSearchParams): EnvironmentInput {
   const number = (key: string) => (params.has(key) ? Number(params.get(key)) : undefined)
   return {
@@ -78,7 +124,10 @@ export function environmentFromParams(params: URLSearchParams): EnvironmentInput
     latitude: number('latitude') ?? number('lat'),
     longitude: number('longitude') ?? number('lng'),
     ground: (params.get('ground') ?? undefined) as GroundCover | undefined,
-    weather: (params.get('weather') ?? undefined) as WeatherKind | undefined
+    weather: (params.get('weather') ?? undefined) as WeatherKind | undefined,
+    timeZone: params.get('timeZone') ?? undefined,
+    utc: params.get('utc') ?? undefined,
+    sun: (params.get('sun') ?? undefined) as SunMode | undefined
   }
 }
 
@@ -209,7 +258,10 @@ const WEATHER: Record<
   }
 }
 
-/** Lowest sun the scene is lit at: below it the clock moves to the nearest dusk (or dawn), so night is never black. */
+/**
+ * Lowest sun the scene is lit at in `'daylight'` mode: below it the clock moves to the nearest dusk (or dawn), so night
+ * is never black.
+ */
 const DUSK_ELEVATION = -3
 
 export interface Atmosphere {
@@ -218,7 +270,22 @@ export interface Atmosphere {
   states: MaterialStateUniforms
   precipitation: Precipitation
   /** The environment as last applied, with the date and position actually used. */
-  readonly applied: { state: EnvironmentState; latitude: number; longitude: number; date: string; sunElevation: number }
+  readonly applied: {
+    state: EnvironmentState
+    latitude: number
+    longitude: number
+    /** The instant the sky was drawn at (after any clock shift), ISO UTC. */
+    date: string
+    /** That instant in `state.timeZone`, when one was given. */
+    localDate: string | null
+    sunElevation: number
+  }
+  /**
+   * The sun asked for and the sun drawn, degrees (to 0.1): `elevation`/`azimuth` at the requested instant,
+   * `drawnElevation`/`drawnAzimuth` after any dusk shift (`clockShiftMinutes`, 0 when none), and the exposure in force.
+   * Azimuth is clockwise from north. Refreshed each frame for `exposure`.
+   */
+  readonly sunRecord: SunRecord
   /** Applies an environment (cheap: no rebuild). `origin` is the package's own position, for the defaults. */
   apply(state: EnvironmentState, origin: { lat: number; lng: number } | null): void
   /** Ground height in three.js space for rain splashes. */
@@ -227,6 +294,18 @@ export interface Atmosphere {
   update(seconds: number, follow: THREE.Vector3): void
   dispose(): void
 }
+
+export interface SunRecord {
+  elevation: number
+  azimuth: number
+  drawnElevation: number
+  drawnAzimuth: number
+  clockShiftMinutes: number
+  exposure: number
+  mode: SunMode
+}
+
+const tenth = (v: number) => Math.round(v * 10) / 10
 
 /** The sky, sun, skylight, haze and weather for a renderer and scene. */
 export async function createAtmosphere(
@@ -358,7 +437,23 @@ export async function createAtmosphere(
 
   let look = WEATHER.clear
   let state = DEFAULT_ENVIRONMENT
-  const applied = { state, latitude: 54, longitude: -122.6, date: '', sunElevation: 0 }
+  const applied: Atmosphere['applied'] = {
+    state,
+    latitude: 54,
+    longitude: -122.6,
+    date: '',
+    localDate: null,
+    sunElevation: 0
+  }
+  const sunRecord: SunRecord = {
+    elevation: 0,
+    azimuth: 0,
+    drawnElevation: 0,
+    drawnAzimuth: 0,
+    clockShiftMinutes: 0,
+    exposure: 1,
+    mode: 'daylight'
+  }
   const _c = new THREE.Color()
   const _grey = new THREE.Color()
 
@@ -367,19 +462,39 @@ export async function createAtmosphere(
     look = WEATHER[next.weather]
     const latitude = next.latitude ?? origin?.lat ?? 54
     const longitude = next.longitude ?? origin?.lng ?? -122.6
-    // The date: as sent, or a mid-July early afternoon in local solar time (about 13:00) for the package's place.
+    // The instant: `utc`, else `dateTime`, else a mid-July early afternoon in local solar time (about 13:00) for the
+    // package's place.
     let ms: number
-    if (next.dateTime) ms = Date.parse(next.dateTime)
+    if (next.utc) ms = Date.parse(next.utc)
+    else if (next.dateTime) ms = Date.parse(next.dateTime)
     else ms = Date.UTC(new Date().getUTCFullYear(), 6, 15, 13) - (longitude / 15) * 3600_000
-    const time = duskFloor(sky, toSimTime(ms), latitude, longitude)
+    const asked = toSimTime(ms)
+    // The parent's sun, when sent: the sky's ephemeris runs a few tenths of a degree off NOAA's, so its clock is
+    // nudged to the moment it stands the sun at that elevation (the azimuth keeps a residue, reported as drawn).
+    const aligned = next.sunPosition
+      ? alignToElevation(sky, asked, next.sunPosition.elevationDegrees, latitude, longitude)
+      : asked
+    // 'true': the real sun at that instant, however low. 'daylight': never below DUSK_ELEVATION.
+    const time = next.sun === 'true' ? aligned : duskFloor(sky, aligned, latitude, longitude)
+    const real = observe(sky.system, asked, { frame: 'local', latitude, longitude, planetCenter: [0, 0, 0] })
+    sunRecord.elevation = tenth(next.sunPosition?.elevationDegrees ?? real.sunElevation)
+    sunRecord.azimuth = tenth(next.sunPosition?.azimuthDegrees ?? real.sunAzimuth)
+    sunRecord.clockShiftMinutes = tenth((time - asked) / 60)
+    sunRecord.mode = next.sun
     const ground = Math.max(0, Math.round(camera.position.y / 50) * 50)
     sky.reset(skyInput(latitude, longitude, Math.round(Date.UTC(2000, 0, 1, 12) + time * 1000), look, ground))
     sky.update(0)
     applied.state = next
     applied.latitude = latitude
     applied.longitude = longitude
-    applied.date = new Date(Date.UTC(2000, 0, 1, 12) + time * 1000).toISOString()
+    const drawnAt = new Date(Date.UTC(2000, 0, 1, 12) + time * 1000)
+    applied.date = drawnAt.toISOString()
+    applied.localDate = next.timeZone
+      ? drawnAt.toLocaleString('sv-SE', { timeZone: next.timeZone, timeZoneName: 'short' })
+      : null
     applied.sunElevation = sky.state.sunElevation
+    sunRecord.drawnElevation = tenth(sky.state.sunElevation)
+    sunRecord.drawnAzimuth = tenth(sky.state.sunAzimuth)
     takeSky() // a rebuilt dome goes back under the sky's own root
     const dull = next.weather !== 'clear'
     deck.visible = dull
@@ -420,10 +535,17 @@ export async function createAtmosphere(
     if (sky.sun.visible) glowColor.value.copy(sky.sun.color).multiplyScalar(lum * 0.6 * look.sun)
     else glowColor.value.setRGB(0, 0, 0)
     sunDirection.value.set(...sky.state.sunDirection)
-    // Bounce light and the cloud deck's light fade with the daylight.
-    fill.intensity = look.fill * (0.1 + 0.9 * day)
+    // Bounce light and the cloud deck's light fade with the daylight; in 'true' mode they go out at night, leaving the
+    // sky's own moon and night fill.
+    const trueSun = state.sun === 'true'
+    fill.intensity = look.fill * (trueSun ? day : 0.1 + 0.9 * day)
     fill.visible = fill.intensity > 1e-3
-    renderer.toneMappingExposure = THREE.MathUtils.clamp(sky.exposure, 0.3, 6) * look.exposure
+    // 'daylight' clamps the sky's exposure suggestion to a day range; 'true' keeps the sky's own figure, and the dull
+    // weather's lift (a camera opening up under cloud) fades out with the daylight instead of brightening the night.
+    renderer.toneMappingExposure = trueSun
+      ? sky.exposure * THREE.MathUtils.lerp(1, look.exposure, day)
+      : THREE.MathUtils.clamp(sky.exposure, 0.3, 6) * look.exposure
+    sunRecord.exposure = Math.round(renderer.toneMappingExposure * 100) / 100
   }
 
   return {
@@ -431,6 +553,7 @@ export async function createAtmosphere(
     states,
     precipitation,
     applied,
+    sunRecord,
     apply,
     setGround(ground) {
       precipitation.ground = ground
@@ -464,6 +587,32 @@ export async function createAtmosphere(
       scene.background = null
     }
   }
+}
+
+/**
+ * The simulation time nearest `time` (within half an hour) at which the sky's ephemeris puts the sun at `elevation`;
+ * `time` itself when it never does in that window (near solar noon, where the elevation barely moves).
+ */
+function alignToElevation(sky: Sky, time: number, elevation: number, latitude: number, longitude: number): number {
+  const off = (t: number) => sunElevationAt(sky.system, t, latitude, longitude) - elevation
+  const here = off(time)
+  if (Math.abs(here) < 1e-3) return time
+  const step = 60
+  for (let k = 1; k <= 30; k++) {
+    for (const t of [time - k * step, time + k * step]) {
+      const near = t < time ? t + step : t - step
+      if (Math.sign(off(t)) === Math.sign(off(near))) continue
+      let lo = near
+      let hi = t
+      for (let i = 0; i < 20; i++) {
+        const mid = (lo + hi) / 2
+        if (Math.sign(off(mid)) === Math.sign(off(lo))) lo = mid
+        else hi = mid
+      }
+      return (lo + hi) / 2
+    }
+  }
+  return time
 }
 
 /**

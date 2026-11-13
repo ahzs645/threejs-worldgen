@@ -10,15 +10,20 @@
 //   in:  { type: 'pgmaps-scene', scene }            build (or rebuild, in place) from a package
 //        { type: 'pgmaps-camera', position: [x, y, z], bearingDegrees, pitchDegrees, verticalFovDegrees }
 //                                                    package local metres, z up; kept until a scene is ready
-//        { type: 'pgmaps-environment', dateTime, latitude, longitude, ground: 'bare' | 'snow',
-//          weather: 'clear' | 'overcast' | 'rain' | 'snow' }
-//                                                    sun from the date and place (a sun below the horizon lights the
-//                                                    scene as at dusk), ground snow, weather; any field may be left
-//                                                    out. Kept and applied to every later build; never rebuilds.
+//        { type: 'pgmaps-environment', dateTime, utc, timeZone, sunPosition, latitude, longitude, ground: 'bare' | 'snow',
+//          weather: 'clear' | 'overcast' | 'rain' | 'snow', sun: 'true' | 'daylight' }
+//                                                    sun from the instant (`utc`, else `dateTime`) and place; with
+//                                                    sun 'daylight' (the default) a sun below the horizon lights the
+//                                                    scene as at dusk, with 'true' the real sun (night is dark); ground
+//                                                    snow, weather; any field may be left out. Kept and applied to
+//                                                    every later build; never rebuilds.
 //   out: { type: 'pgmaps-engine-hello', engine }    listening, send a scene
 //        { type: 'pgmaps-engine-ready', engine }    first full frame of a (new) scene drawn
 //        { type: 'pgmaps-engine-error', engine, message }
-//        { type: 'pgmaps-engine-stats', engine, drawn, instances, meshes, fps, stems }   about once a second
+//        { type: 'pgmaps-engine-stats', engine, drawn, instances, meshes, fps, stems, seatAdjustMaxM, seatAdjustMeanM,
+//          sun: { elevation, azimuth, drawnElevation, drawnAzimuth, clockShiftMinutes, exposure, mode } }
+//                                                    about once a second. seatAdjust*: |package z − drawn ground| over
+//                                                    the drawn stems, m. sun: degrees, the asked and the drawn sun.
 // With ?embed the status overlay is hidden and the orbit controls take no pointer input: the parent owns the camera.
 //
 // The package is local metres: x east, y north, z up (heights absolute). three.js here is y up with north at −z,
@@ -114,7 +119,39 @@ function setCamera(eye: PackageCamera) {
 }
 
 // ---------------------------------------------------------------- one package's ground, slash, water and stand
-type Built = { scatter: Scatter; ground: Ground; stems: number; dispose(): void }
+type Built = { scatter: Scatter; ground: Ground; stems: number; seat: SeatRecord; dispose(): void }
+
+/** How far seating moved the stems: |package z − drawn ground| at each drawn stem, metres. */
+type SeatRecord = { maxM: number; meanM: number }
+
+/**
+ * Stems stand on this engine's own ground (`groundAt`, bilinear on the package's terrain grid), not at the package's
+ * `z`: a stem placed at its own `z` floats or sinks wherever the 15 m grid's facets leave the drawn ground. Seating
+ * stays; this measures what it moved, over the stems that are drawn (not those standing in water).
+ */
+function seatRecord(pkg: ScenePackage, ground: Ground): SeatRecord {
+  const stride = pkg.trees.fields.length
+  const zField = pkg.trees.fields.indexOf('z')
+  const data = pkg.trees.data
+  let max = 0
+  let sum = 0
+  let n = 0
+  if (zField >= 0)
+    for (let i = 0; i < pkg.trees.count; i++) {
+      const o = i * stride
+      const x = data[o]
+      const y = data[o + 1]
+      const z = data[o + zField]
+      if (!Number.isFinite(z) || ground.inWater(x, y)) continue
+      const d = Math.abs(z - ground.groundAt(x, y))
+      if (!Number.isFinite(d)) continue
+      max = Math.max(max, d)
+      sum += d
+      n++
+    }
+  const round = (v: number) => Math.round(v * 100) / 100
+  return { maxM: round(max), meanM: round(n ? sum / n : 0) }
+}
 
 /**
  * True while impostors bake. The bake binds its atlas as the render target and awaits shader compiles between
@@ -145,6 +182,7 @@ async function build(pkg: ScenePackage): Promise<Built> {
     baking = false
   })
   console.log(`fixed instances: ${stand.stems}`)
+  const seat = seatRecord(pkg, ground)
   const scatter = Scatter.create({
     camera,
     scene,
@@ -161,6 +199,7 @@ async function build(pkg: ScenePackage): Promise<Built> {
     scatter,
     ground,
     stems: stand.stems,
+    seat,
     dispose() {
       scatter.dispose()
       ground.dispose()
@@ -326,7 +365,10 @@ renderer.setAnimationLoop(() => {
       instances: s.instances,
       meshes: s.meshes,
       fps: Math.round(fps),
-      stems: current.stems
+      stems: current.stems,
+      seatAdjustMaxM: current.seat.maxM,
+      seatAdjustMeanM: current.seat.meanM,
+      sun: { ...atmosphere.sunRecord }
     })
   }
   // `&still`: once the stand has streamed in, stop on that frame (for screenshots and comparisons).

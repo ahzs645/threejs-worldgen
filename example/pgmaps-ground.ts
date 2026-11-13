@@ -19,6 +19,7 @@ import {
 import { hash, mulberry32 } from 'threejs-scatter'
 import { Lakes, WaterPrepass, type HydrologyResult } from 'threejs-water'
 import { applyMaterialStatesTo, type MaterialStateUniforms } from 'threejs-weathering'
+import { openingSeed, pileSeed } from './pgmaps-tree-bins'
 
 type Ring = Array<[number, number]>
 
@@ -72,6 +73,8 @@ function edgeDistance(ring: Ring, x: number, y: number) {
 interface Area {
   rings: Ring[]
   box: [number, number, number, number]
+  /** From the polygon's own outer ring (`openingSeed`), never its place in the package's list. */
+  seed: number
 }
 const areaOf = (rings: Ring[]): Area => {
   const box: Area['box'] = [Infinity, Infinity, -Infinity, -Infinity]
@@ -81,7 +84,7 @@ const areaOf = (rings: Ring[]): Area => {
     box[2] = Math.max(box[2], x)
     box[3] = Math.max(box[3], y)
   }
-  return { rings, box }
+  return { rings, box, seed: openingSeed(rings) }
 }
 const inArea = (a: Area, x: number, y: number) =>
   x >= a.box[0] &&
@@ -363,7 +366,10 @@ function horizonApron(size: number, groundAt: (x: number, y: number) => number, 
 
 const random = (seed: number) => mulberry32(hash(seed, 0x51a5))
 
-/** Stumps across every opening: a jittered grid at about 500 stems a hectare (a harvested pine/spruce stand). */
+/**
+ * Stumps across every opening: a jittered grid at about 500 stems a hectare (a harvested pine/spruce stand). Each
+ * opening's stumps are seeded from its own geometry, so the list's order does not move them.
+ */
 function stumpsOf(openings: Area[], groundAt: (x: number, y: number) => number, ponds: Area[]) {
   const geometry = new THREE.CylinderGeometry(0.47, 0.55, 1, 10, 1, false)
   geometry.translate(0, 0.5, 0)
@@ -381,8 +387,8 @@ function stumpsOf(openings: Area[], groundAt: (x: number, y: number) => number, 
   const q = new THREE.Quaternion()
   const e = new THREE.Euler()
   const step = 4.4
-  for (const [k, a] of openings.entries()) {
-    const rand = random(k + 1)
+  for (const a of openings) {
+    const rand = random(a.seed)
     for (let x = a.box[0]; x <= a.box[2]; x += step)
       for (let y = a.box[1]; y <= a.box[3]; y += step) {
         const px = x + (rand() - 0.5) * step * 0.9
@@ -444,7 +450,7 @@ function slashOf(
   for (let i = 0; i < debris.count; i++) {
     const [x, y, , footprint] = debris.data.slice(i * 4, i * 4 + 4)
     if (inWater(x, y)) continue
-    const rand = random(1000 + i)
+    const rand = random(pileSeed(x, y, footprint))
     const heading = rand() * Math.PI
     const span = Math.max(1.5, footprint)
     const count = 5 + Math.floor(rand() * 6)
@@ -493,8 +499,8 @@ function slashOf(
     }
   }
   // Branches strewn over the openings, a few hundred to the hectare.
-  for (const [k, a] of openings.entries()) {
-    const rand = random(5000 + k)
+  for (const a of openings) {
+    const rand = random(a.seed ^ 0x5a5a)
     const areaM2 = (a.box[2] - a.box[0]) * (a.box[3] - a.box[1])
     const n = Math.min(30_000, Math.round(areaM2 / 30))
     for (let i = 0; i < n; i++) {
@@ -522,9 +528,10 @@ function slashOf(
     const q = new THREE.Quaternion()
     const e = new THREE.Euler()
     const c = new THREE.Color()
-    const rand = random(count)
     for (let i = 0; i < count; i++) {
       const o = i * 9
+      // Tint from the piece's own position, not its index: a pile or opening gone from the list recolours nothing else.
+      const rand = random(hash(Math.floor(list[o] * 1000), Math.floor(list[o + 2] * 1000), 0x7a11))
       // Logs and twigs lie along their length: the cylinder's y axis turned down to horizontal, then yawed.
       e.set(0, list[o + 3], lay ? Math.PI / 2 + list[o + 4] : 0, 'YXZ')
       m.compose(

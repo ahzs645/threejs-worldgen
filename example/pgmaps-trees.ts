@@ -1,5 +1,6 @@
-// The PGMaps stand as threejs-trees: each species grown by space colonisation at the package's own stem sizes (a few
-// height classes per species, so a stem is scaled by little and keeps its branch and leaf-card proportions), drawn as
+// The PGMaps stand as threejs-trees: each species grown by space colonisation in height classes on a fixed ladder
+// (pgmaps-tree-bins.ts, so a stem is scaled by little, keeps its branch and leaf-card proportions, and keeps its shape
+// whatever other stems a harvest removes), drawn as
 // full, simplified and coarse meshes out to a few hundred metres and as baked impostors beyond.
 import * as THREE from 'three/webgpu'
 import { disposeLayers, FIXED_INSTANCE_STRIDE, hash, hashString, type ScatterLayer } from 'threejs-scatter'
@@ -10,11 +11,12 @@ import {
   species as presets,
   type TreeParams
 } from 'threejs-trees'
+import { binCrownWidth, binSeed, heightBin, TREE_HEIGHT_LADDER } from './pgmaps-tree-bins'
 
 /** The stems of a package (`trees` block) and its species table. */
 export interface StandInput {
   trees: { fields: string[]; species: string[]; count: number; data: number[] }
-  species: Record<string, { crownBase: number; crownRatio: number; broadleaf: boolean } | undefined>
+  species: Record<string, { crownBase: number; crownRatio?: number; broadleaf: boolean } | undefined>
 }
 
 /**
@@ -25,12 +27,6 @@ export interface StandInput {
 export const TREE_LOD_METRES = { full: 55, simplified: 120, coarse: 190 }
 /** Detail of the simplified and coarse meshes (see `generateTreeLevels`). */
 const DETAIL = { simplified: 0.35, coarse: 0.16 }
-
-/** A species' variant: a height class grown at that size. */
-interface Variant {
-  height: number
-  width: number
-}
 
 /**
  * Generator settings for PGMaps' species, at a variant's height `h`, crown width `w` and crown base (fraction of the
@@ -135,45 +131,38 @@ function recipe(name: string, h: number, w: number, crownBase: number): TreePara
   }
 }
 
-/** One species' layers, kept between packages while its variants' sizes and crown base stay the same. */
+/**
+ * One species' grown height classes, kept between packages while its crown base, crown ratio and draw distance stay
+ * the same. Classes are added as stems need them and kept while the species is in use, so a drive that steps into a
+ * taller or shorter stand grows only the new class, and a class that comes back is the same tree as before.
+ */
 interface SpeciesEntry {
   key: string
-  layers: ScatterLayer[]
-  /** Each layer's own levels (a layer with no stems loses all but its first, so they are restored on reuse). */
-  lods: ScatterLayer['lods'][]
-  impostors: ScatterLayer['impostor'][]
-  variants: Variant[]
-  /** Each variant's measured size, for scaling stems to it. */
-  measured: { height: number; width: number }[]
+  /** Built classes by ladder index (`TREE_HEIGHT_LADDER`). */
+  bins: Map<number, BinEntry>
+  /** Bark and leaf materials every class of the species shares (one pipeline). */
+  material: THREE.Material | THREE.Material[] | null
+}
+interface BinEntry {
+  layer: ScatterLayer
+  /** The layer's own levels (a layer with no stems loses all but its first, so they are restored on reuse). */
+  lods: ScatterLayer['lods']
+  impostor: ScatterLayer['impostor']
+  /** The grown tree's measured size, for scaling stems to it. */
+  measured: { height: number; width: number }
 }
 
 const cache = new Map<string, SpeciesEntry>()
 /** Layers dropped from the cache while the previous stand may still be drawing them; freed by `disposeRetiredStands`. */
 const retired: ScatterLayer[][] = []
 
-const quantile = (sorted: number[], q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]
-const median = (values: number[]) =>
-  quantile(
-    values.slice().sort((a, b) => a - b),
-    0.5
-  )
-
-/** Height classes of a species from its stems: three for a big population, fewer for a handful of stems. */
-function variantsOf(heights: number[], widths: number[]): Variant[] {
-  const sorted = heights.slice().sort((a, b) => a - b)
-  const qs = heights.length >= 40 ? [0.2, 0.55, 0.85] : heights.length >= 8 ? [0.3, 0.75] : [0.5]
-  // Sizes are rounded (2 m, 0.5 m) so that the next package on a drive usually finds the same variants cached.
-  const classes = [...new Set(qs.map((q) => Math.max(4, Math.round(quantile(sorted, q) / 2) * 2)))]
-  return classes.map((height) => {
-    const near = widths.filter((_, i) => Math.abs(heights[i] - height) <= 2.5)
-    const width = near.length ? median(near) : median(widths)
-    return { height, width: Math.max(1, Math.round(width * 2) / 2) }
-  })
-}
-
 /**
  * Builds (or reuses) the layers for a package's stand and fills them with its stems. `renderer` bakes impostors;
  * `null` draws meshes only. Layers no longer used are disposed.
+ *
+ * Each stem is drawn with the class of its own height on a fixed ladder (`heightBin`), grown at a crown width fixed
+ * by the class and the species (`binCrownWidth`) from a seed fixed by them (`binSeed`), then scaled to the stem's own
+ * height and crown width. Nothing depends on the other stems, so a harvest leaves every retained stem's shape alone.
  */
 export async function standLayers(
   pkg: StandInput,
@@ -185,128 +174,128 @@ export async function standLayers(
 ): Promise<{ layers: ScatterLayer[]; stems: number }> {
   const stride = pkg.trees.fields.length
   const data = pkg.trees.data
-  const bySpecies = new Map<number, number[]>()
+  /** Stems by species, then by ladder class. */
+  const bySpecies = new Map<number, Map<number, number[]>>()
   for (let i = 0; i < pkg.trees.count; i++) {
     if (exclude(data[i * stride], data[i * stride + 1])) continue
     const s = data[i * stride + 3]
-    let list = bySpecies.get(s)
-    if (!list) bySpecies.set(s, (list = []))
+    let bins = bySpecies.get(s)
+    if (!bins) bySpecies.set(s, (bins = new Map()))
+    const bin = heightBin(data[i * stride + 4])
+    let list = bins.get(bin)
+    if (!list) bins.set(bin, (list = []))
     list.push(i)
   }
 
   const used = new Set<string>()
   const layers: ScatterLayer[] = []
   let stems = 0
-  for (const [speciesIndex, members] of bySpecies) {
+  for (const [speciesIndex, bins] of bySpecies) {
     const name = pkg.trees.species[speciesIndex]
     const crownBase = pkg.species[name]?.crownBase ?? 0.3
-    const heights = members.map((i) => data[i * stride + 4])
-    const widths = members.map((i) => data[i * stride + 5])
-    const variants = variantsOf(heights, widths)
-    const key = JSON.stringify([crownBase, variants, maxDistance])
+    const crownRatio = pkg.species[name]?.crownRatio
+    const key = JSON.stringify([crownBase, crownRatio ?? null, maxDistance])
     let entry = cache.get(name)
     if (entry && entry.key !== key) {
-      retired.push(entry.layers)
+      retired.push([...entry.bins.values()].map((b) => b.layer))
       cache.delete(name)
       entry = undefined
     }
     if (!entry) {
-      onStatus(`growing ${name} (${variants.length} height classes)…`)
-      entry = await buildSpecies(name, crownBase, variants, renderer, maxDistance)
-      entry.key = key
+      entry = { key, bins: new Map(), material: null }
       cache.set(name, entry)
     }
     used.add(name)
+    const missing = [...bins.keys()].filter((b) => !entry.bins.has(b)).sort((a, b) => a - b)
+    if (missing.length) onStatus(`growing ${name} (${missing.map((b) => `${TREE_HEIGHT_LADDER[b]} m`).join(', ')})…`)
+    for (const bin of missing)
+      entry.bins.set(
+        bin,
+        await buildBin(name, bin, crownBase, binCrownWidth(name, bin, crownRatio), entry, renderer, maxDistance)
+      )
 
-    // Stems into their nearest height class, each scaled from that variant's measured size to its own.
-    const lists = entry.variants.map(() => [] as number[])
-    for (const i of members) {
-      const o = i * stride
-      const h = data[o + 4]
-      let best = 0
-      for (let v = 1; v < entry.variants.length; v++)
-        if (Math.abs(Math.log(entry.variants[v].height / h)) < Math.abs(Math.log(entry.variants[best].height / h)))
-          best = v
-      const m = entry.measured[best]
-      const yaw = (data[o + 6] * 6.283185 + data[o] * 0.37) % 6.283185
-      lists[best].push(data[o], -data[o + 1], yaw, data[o + 5] / m.width, h / m.height)
-    }
-    entry.layers.forEach((layer, v) => {
-      layer.lods = entry.lods[v]
-      layer.impostor = entry.impostors[v]
-      layer.instances = new Float32Array(lists[v])
-      if (lists[v].length === 0) layer.lods = layer.lods.slice(0, 1)
-      stems += lists[v].length / FIXED_INSTANCE_STRIDE
+    // Classes in ladder order, each stem scaled from its class's measured size to its own.
+    for (const [bin, members] of [...bins].sort((a, b) => a[0] - b[0])) {
+      const built = entry.bins.get(bin)
+      if (!built) continue
+      const m = built.measured
+      const list: number[] = []
+      for (const i of members) {
+        const o = i * stride
+        const yaw = (data[o + 6] * 6.283185 + data[o] * 0.37) % 6.283185
+        list.push(data[o], -data[o + 1], yaw, data[o + 5] / m.width, data[o + 4] / m.height)
+      }
+      const layer = built.layer
+      layer.lods = built.lods
+      layer.impostor = built.impostor
+      layer.instances = new Float32Array(list)
+      stems += list.length / FIXED_INSTANCE_STRIDE
       layers.push(layer)
-    })
+    }
   }
   for (const [name, entry] of cache)
     if (!used.has(name)) {
-      retired.push(entry.layers)
+      retired.push([...entry.bins.values()].map((b) => b.layer))
       cache.delete(name)
     }
   return { layers, stems }
 }
 
-async function buildSpecies(
+/** Grows one height class of a species. The first class grown sets the materials the species' later classes share. */
+async function buildBin(
   name: string,
+  bin: number,
   crownBase: number,
-  variants: Variant[],
+  width: number,
+  entry: SpeciesEntry,
   renderer: THREE.WebGPURenderer | null,
   maxDistance: number
-): Promise<SpeciesEntry> {
-  const layers: ScatterLayer[] = []
-  const measured: SpeciesEntry['measured'] = []
-  let shared: THREE.Material | THREE.Material[] | null = null
-  for (let v = 0; v < variants.length; v++) {
-    const { height, width } = variants[v]
-    const params = recipe(name, height, width, crownBase)
-    const id = `${name}@${height}`
-    // createVegetationLayers scales its distances by size / 15 m; undo that so the levels end where we say.
-    const k = Math.min(3, Math.max(0.12, height / 15))
-    const [layer] = await createVegetationLayers({
-      species: [{ name: id, params, density: 0, variants: 1 }],
-      lodDistances: [TREE_LOD_METRES.full / k, TREE_LOD_METRES.simplified / k, maxDistance / k],
-      simplifiedDetail: DETAIL.simplified,
-      seed: 7,
-      renderer,
-      impostor: { size: 1024, frames: 7 },
-      castShadow: true
-    })
-    // A third, coarse mesh between the simplified one and the impostor: the same tree (same seed) with fewer cards.
-    const [coarse] = generateTreeLevels(params, hash(7, hashString(id), 0), [DETAIL.coarse])
-    const material = layer.lods[0].material
-    // Every variant of a species has the same bark and leaves, so they share one set of materials (one pipeline).
-    if (shared) {
-      for (const m of Array.isArray(material) ? material : [material]) m.dispose()
-      for (const lod of layer.lods) lod.material = shared
-    } else shared = material
-    layer.lods = [
-      { ...layer.lods[0], distance: TREE_LOD_METRES.full },
-      { ...layer.lods[1], distance: TREE_LOD_METRES.simplified, castShadow: false },
-      {
-        distance: layer.impostor ? TREE_LOD_METRES.coarse : maxDistance,
-        geometry: mergeTreeGeometry(coarse),
-        material: layer.lods[0].material,
-        castShadow: false
-      }
-    ]
-    if (layer.impostor) layer.impostor.distance = maxDistance
-    layer.colorVariation = 0.12
-    layer.sink = 0.05
-    const box =
-      layer.lods[0].geometry.boundingBox ??
-      new THREE.Box3().setFromBufferAttribute(layer.lods[0].geometry.attributes.position as THREE.BufferAttribute)
-    measured.push({ height: box.max.y, width: Math.max(box.max.x - box.min.x, box.max.z - box.min.z) })
-    layers.push(layer)
-  }
+): Promise<BinEntry> {
+  const height = TREE_HEIGHT_LADDER[bin]
+  const params = recipe(name, height, width, crownBase)
+  const id = `${name}@${height}`
+  const seed = binSeed(name, bin)
+  // createVegetationLayers scales its distances by size / 15 m; undo that so the levels end where we say.
+  const k = Math.min(3, Math.max(0.12, height / 15))
+  const [layer] = await createVegetationLayers({
+    species: [{ name: id, params, density: 0, variants: 1 }],
+    lodDistances: [TREE_LOD_METRES.full / k, TREE_LOD_METRES.simplified / k, maxDistance / k],
+    simplifiedDetail: DETAIL.simplified,
+    seed,
+    renderer,
+    impostor: { size: 1024, frames: 7 },
+    castShadow: true
+  })
+  // A third, coarse mesh between the simplified one and the impostor: the same tree (the seed
+  // createVegetationLayers gives its one variant) with fewer cards.
+  const [coarse] = generateTreeLevels(params, hash(seed, hashString(id), 0), [DETAIL.coarse])
+  const material = layer.lods[0].material
+  // Every class of a species has the same bark and leaves, so they share one set of materials (one pipeline).
+  if (entry.material) {
+    for (const m of Array.isArray(material) ? material : [material]) m.dispose()
+    for (const lod of layer.lods) lod.material = entry.material
+  } else entry.material = material
+  layer.lods = [
+    { ...layer.lods[0], distance: TREE_LOD_METRES.full },
+    { ...layer.lods[1], distance: TREE_LOD_METRES.simplified, castShadow: false },
+    {
+      distance: layer.impostor ? TREE_LOD_METRES.coarse : maxDistance,
+      geometry: mergeTreeGeometry(coarse),
+      material: layer.lods[0].material,
+      castShadow: false
+    }
+  ]
+  if (layer.impostor) layer.impostor.distance = maxDistance
+  layer.colorVariation = 0.12
+  layer.sink = 0.05
+  const box =
+    layer.lods[0].geometry.boundingBox ??
+    new THREE.Box3().setFromBufferAttribute(layer.lods[0].geometry.attributes.position as THREE.BufferAttribute)
   return {
-    key: '',
-    layers,
-    lods: layers.map((l) => l.lods),
-    impostors: layers.map((l) => l.impostor),
-    variants,
-    measured
+    layer,
+    lods: layer.lods,
+    impostor: layer.impostor,
+    measured: { height: box.max.y, width: Math.max(box.max.x - box.min.x, box.max.z - box.min.z) }
   }
 }
 
@@ -318,6 +307,6 @@ export function disposeRetiredStands(): void {
 /** Frees every cached species (page unload). */
 export function disposeStandCache(): void {
   disposeRetiredStands()
-  for (const entry of cache.values()) disposeLayers(entry.layers)
+  for (const entry of cache.values()) disposeLayers([...entry.bins.values()].map((b) => b.layer))
   cache.clear()
 }
