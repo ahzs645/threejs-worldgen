@@ -297,7 +297,6 @@ async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
   const seat = seatRecord(pkg, ground)
   const scatter = Scatter.create({
     camera,
-    scene,
     terrain: (x: number, z: number) => ground.groundAt(x, -z),
     layers: stand.layers,
     seed: 1,
@@ -496,7 +495,8 @@ async function load(pkg: ScenePackage) {
         capturer.forgetMaterials() // class-pass copies of the old stand's materials
         disposeRetiredStands() // species the new package no longer uses, now nothing draws them
         current = built
-        scene.add(built.ground.group)
+        // prepareFrame updates the mounted scatter. A scene hook would chain to the disposed stand on replacement.
+        scene.add(built.scatter.object, built.ground.group)
         camera.far =
           built.ground.farExtent || built.ground.skylineExtent
             ? Math.max(LIVE_FAR, built.ground.apronRadius + 1000)
