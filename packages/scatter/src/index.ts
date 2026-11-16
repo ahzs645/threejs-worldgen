@@ -25,6 +25,8 @@ export {
 } from './placement.ts'
 export type { DensityFn, PlacementRules, ScatterCluster } from './placement.ts'
 export { poissonDisk } from './poisson.ts'
+export { alphaCoverage, coverageMips, coverageScale } from './coverage-mips.ts'
+export type { MipLevel } from './coverage-mips.ts'
 export { selectLod } from './lod.ts'
 export { directionToFrame, frameDirection, octDecode, octEncode } from './octahedral.ts'
 export type { Vec3Tuple } from './octahedral.ts'

@@ -1,7 +1,9 @@
 import {
   Box3,
   Color,
+  DataTexture,
   LinearFilter,
+  LinearMipmapLinearFilter,
   type Mesh,
   MeshStandardNodeMaterial,
   type NodeMaterial,
@@ -11,6 +13,8 @@ import {
   Scene,
   Sphere,
   SRGBColorSpace,
+  RGBAFormat,
+  UnsignedByteType,
   Vector3,
   type BufferGeometry,
   type Material,
@@ -45,6 +49,7 @@ import {
   vec4
 } from 'three/tsl'
 import { frameDirection } from './octahedral.ts'
+import { coverageMips } from './coverage-mips.ts'
 
 /** How an impostor is baked and drawn. */
 export interface ImpostorOptions {
@@ -63,6 +68,13 @@ export interface ImpostorOptions {
   hemisphere: boolean
   /** Alpha below which impostor pixels are discarded. */
   alphaTest: number
+  /**
+   * `'none'`: the colour atlas is sampled at full resolution at any distance (bright texels such as pale bark alias
+   * into speckle once a view is a few pixels across). `'coverage'`: the atlas is read back after the bake and given
+   * mipmaps, each view reduced on its own and its alpha scaled so the alpha test keeps the base level's coverage
+   * (Castaño); needs `size / frames` to be a power of two (`size: 896, frames: 7`), else it falls back to `'none'`.
+   */
+  mipmaps: 'none' | 'coverage'
 }
 
 /** Result of {@link bakeImpostor}: an atlas plus a material and quad ready to be a `ScatterLayer.impostor`. */
@@ -115,7 +127,8 @@ export const DEFAULT_IMPOSTOR: ImpostorOptions = {
   frames: 8,
   size: 1024,
   hemisphere: true,
-  alphaTest: 0.5
+  alphaTest: 0.5,
+  mipmaps: 'none'
 }
 
 /**
@@ -234,8 +247,9 @@ export async function bakeImpostor(
   const geometry = new PlaneGeometry(2, 2)
   // Explicit bounds: the material moves and scales the quad per instance.
   geometry.boundingSphere = new Sphere(new Vector3(), Math.SQRT2)
+  const albedo = o.mipmaps === 'coverage' ? await coverageAtlas(renderer, albedoTarget, frames, o.alphaTest) : null
   const { material, surface } = createImpostorMaterial(
-    albedoTarget.texture,
+    albedo ?? albedoTarget.texture,
     normalTarget.texture,
     { ...o, frames },
     bounds
@@ -246,10 +260,11 @@ export async function bakeImpostor(
   material.dispose = () => {
     disposeMaterial()
     albedoTarget.dispose()
+    albedo?.dispose()
     normalTarget.dispose()
   }
   return {
-    texture: albedoTarget.texture,
+    texture: albedo ?? albedoTarget.texture,
     normalTexture: normalTarget.texture,
     surface,
     material,
@@ -260,6 +275,43 @@ export async function bakeImpostor(
       material.dispose()
       geometry.dispose()
     }
+  }
+}
+
+/**
+ * The baked colour atlas read back and given coverage-preserving mipmaps, each view cell reduced on its own (no view
+ * bleeds into its neighbour); null when the cells are not a power of two or the read fails (the atlas stays as baked).
+ */
+async function coverageAtlas(
+  renderer: Renderer,
+  target: RenderTarget,
+  frames: number,
+  alphaTest: number
+): Promise<DataTexture | null> {
+  const size = target.width
+  const cell = size / frames
+  if (!Number.isInteger(cell) || (cell & (cell - 1)) !== 0) return null
+  try {
+    const read = (await (renderer as any).readRenderTargetPixelsAsync(target, 0, 0, size, size)) as Uint8Array
+    const raw = new Uint8Array(read.buffer, read.byteOffset, size * size * 4)
+    // Rows as the render target is sampled: WebGPU reads back top row first; WebGL bottom first.
+    const webgl = (renderer as any).backend?.isWebGLBackend === true
+    const data = new Uint8Array(size * size * 4)
+    for (let y = 0; y < size; y++) {
+      const from = (webgl ? size - 1 - y : y) * size * 4
+      data.set(raw.subarray(from, from + size * 4), y * size * 4)
+    }
+    const levels = coverageMips({ data, width: size, height: size }, cell, cell, alphaTest, 4)
+    const texture = new DataTexture(levels[0].data, size, size, RGBAFormat, UnsignedByteType)
+    texture.mipmaps = levels.map((l) => ({ data: l.data, width: l.width, height: l.height })) as any
+    texture.generateMipmaps = false
+    texture.minFilter = LinearMipmapLinearFilter
+    texture.magFilter = LinearFilter
+    texture.colorSpace = SRGBColorSpace
+    texture.needsUpdate = true
+    return texture
+  } catch {
+    return null
   }
 }
 

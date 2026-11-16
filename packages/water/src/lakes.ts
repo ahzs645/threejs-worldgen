@@ -66,6 +66,12 @@ export interface LakesOptions extends LakesInput {
    * normals and colour in the same frame. `null` (default) = the renderer's own depth/colour readback.
    */
   prepass?: WaterPrepass | null
+  /**
+   * Optional planar reflection (a three.js `reflector()` node whose target stands at the lakes' level, facing up),
+   * used on the lake surfaces at `uniforms.planarHeight`; see `createWaterMaterial`.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: a TSL texture node (ReflectorNode)
+  planar?: any
 }
 
 /** Default lakes: calm, slightly green fresh water with light wind ripples. */
@@ -136,6 +142,10 @@ export class Lakes {
   private meshKey = ''
   private environment: unknown = undefined
   private materialPrepass: WaterPrepass | null = null
+  // biome-ignore lint/suspicious/noExplicitAny: a TSL texture node (ReflectorNode)
+  private planar: any = null
+  // biome-ignore lint/suspicious/noExplicitAny: a TSL texture node (ReflectorNode)
+  private materialPlanar: any = null
   private lakeMesh: Mesh<BufferGeometry, MeshBasicNodeMaterial> | null = null
   private riverMesh: Mesh<BufferGeometry, MeshBasicNodeMaterial> | null = null
   private lakeMaterial: MeshBasicNodeMaterial | null = null
@@ -161,12 +171,14 @@ export class Lakes {
     scene,
     renderer: _renderer,
     prepass = null,
+    planar = null,
     ...input
   }: LakesOptions) {
     this.hydrology = hydrology
     this.frame = frame
     this.camera = camera
     this.prepass = prepass
+    this.planar = planar
     this.object.name = 'Lakes'
     this.object.matrixAutoUpdate = false
     this.set(input)
@@ -195,12 +207,17 @@ export class Lakes {
       applyWaves(this.uniforms, this.waves, s.waves.direction[0], s.waves.direction[1])
       applyWaves(this.riverUniforms, [], s.waves.direction[0], s.waves.direction[1])
     }
-    if (s.environment !== this.environment || this.prepass !== this.materialPrepass) {
+    if (
+      s.environment !== this.environment ||
+      this.prepass !== this.materialPrepass ||
+      this.planar !== this.materialPlanar
+    ) {
       this.environment = s.environment
       this.materialPrepass = this.prepass
+      this.materialPlanar = this.planar
       this.lakeMaterial?.dispose()
       this.riverMaterial?.dispose()
-      this.lakeMaterial = createWaterMaterial(this.uniforms, 'waves', s.environment, this.prepass)
+      this.lakeMaterial = createWaterMaterial(this.uniforms, 'waves', s.environment, this.prepass, this.planar)
       this.riverMaterial = createWaterMaterial(this.riverUniforms, 'flow', s.environment, this.prepass)
       if (this.lakeMesh) this.lakeMesh.material = this.lakeMaterial
       if (this.riverMesh) this.riverMesh.material = this.riverMaterial
@@ -223,6 +240,14 @@ export class Lakes {
   setPrepass(prepass: WaterPrepass | null): this {
     if (prepass === this.prepass) return this
     this.prepass = prepass
+    return this.set({})
+  }
+
+  /** Uses (or drops, with `null`) a planar reflection on the lakes, rebuilding the materials. */
+  // biome-ignore lint/suspicious/noExplicitAny: a TSL texture node (ReflectorNode)
+  setPlanar(planar: any): this {
+    if (planar === this.planar) return this
+    this.planar = planar
     return this.set({})
   }
 

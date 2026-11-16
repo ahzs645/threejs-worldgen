@@ -49,6 +49,7 @@ import {
   positionWorld,
   pow,
   reflect,
+  screenSize,
   screenUV,
   select,
   sin,
@@ -153,6 +154,34 @@ export function createWaterUniforms() {
     horizonColor: uniform(new Color(DEFAULT_APPEARANCE.horizonColor)),
     /** `environmentIntensity`. */
     environmentIntensity: uniform(1),
+    /**
+     * Metres a screen-space reflection ray travels before it falls back to the environment (default 250). Raise it
+     * for a lake seen across kilometres, so its far shore is reflected rather than the sky in its place.
+     */
+    reflectionReach: uniform(REFLECTION_REACH),
+    /**
+     * Planar reflection (`createWaterMaterial`'s `planar`): the surface height it mirrors about (m, world y), and how
+     * much of the reflection it gives where the surface stands at that height (0 … 1; elsewhere the screen-space one).
+     */
+    planarHeight: uniform(0),
+    planarStrength: uniform(1),
+    /** How far the surface's normal bends the planar reflection (screen fraction per unit of normal tilt). */
+    planarDistortion: uniform(0.02),
+    /**
+     * Blur of the planar reflection, pixels: x across, y up and down (the stretched shoreline streaks of rippled water;
+     * `reflectionBlurPx` of the wind's slope variance). 0, 0 is a mirror.
+     */
+    reflectionBlur: uniform(new Vector2(0, 0)),
+    /** A colour the reflection is pulled toward (by `reflectionTintAmount`) and a multiplier on it: a stylised lake. */
+    reflectionTint: uniform(new Color(0x41505e)),
+    reflectionTintAmount: uniform(0),
+    reflectionDarken: uniform(1),
+    /** A band of `shoreBandColor` at the waterline, `shoreBandPixels` wide on screen (0 strength: none). */
+    shoreBand: uniform(0),
+    shoreBandColor: uniform(new Color(0x9c8a68)),
+    shoreBandPixels: uniform(2),
+    /** Darkens the water within a few metres of depth of the shore (0 … 1). */
+    shoreDarkening: uniform(0),
     /** `specular`. */
     specular: uniform(1),
     /** `foamColor`. */
@@ -499,7 +528,7 @@ export function updateSun(
 }
 
 const TAU = Math.PI * 2
-/** Metres a screen-space reflection ray travels before it falls back to the environment. */
+/** Metres a screen-space reflection ray travels before it falls back to the environment, by default. */
 const REFLECTION_REACH = 250
 /** March steps for one reflection ray; the depth crossing is then bisected a few times. */
 const REFLECTION_STEPS = 24
@@ -569,7 +598,14 @@ export function createWaterMaterial(
   u: WaterUniforms,
   kind: 'waves' | 'flow',
   environment: Texture | null = null,
-  prepass: WaterPrepass | null = null
+  prepass: WaterPrepass | null = null,
+  /**
+   * A planar reflection of the scene about the water's level (a three.js `reflector()` node, its target placed at the
+   * surface facing up): exact for flat water, and it holds what stands off screen. Used where the surface stands at
+   * `planarHeight`; elsewhere the screen-space reflection.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: a TSL texture node (ReflectorNode)
+  planar: any = null
 ): MeshBasicNodeMaterial {
   const material = new MeshBasicNodeMaterial({ side: FrontSide })
   material.transparent = true // draw after opaque geometry, so the depth and colour behind are available
@@ -787,7 +823,7 @@ export function createWaterMaterial(
     let reflection = sky as any
     if (prepass) {
       const mirrored = normalize(cameraViewMatrix.mul(vec4(R, 0)).xyz).toVar()
-      const rayEnd = positionView.add(mirrored.mul(float(REFLECTION_REACH))).toVar()
+      const rayEnd = positionView.add(mirrored.mul(u.reflectionReach)).toVar()
       If(rayEnd.z.greaterThan(cameraNear.negate()), () => {
         // A ray coming back towards the camera stops at the near plane.
         rayEnd.assign(
@@ -848,6 +884,31 @@ export function createWaterMaterial(
       const traced = select(hit, weight, float(0))
       reflection = mix(sky, prepass.colour(hitUv), traced)
     }
+    if (planar) {
+      // The mirrored render, sampled where this pixel's mirror image is (the render is flipped across), bent by the
+      // surface normal and blurred up and down by the wind's roughness: 7 taps along the streak.
+      const onPlane = float(1)
+        .sub(smoothstep(0.4, 1.2, abs(positionWorld.y.sub(u.planarHeight))))
+        .mul(u.planarStrength)
+      const tilt = cameraViewMatrix.mul(vec4(N.sub(U), 0)).xy
+      const base = vec2(float(1).sub(screenUV.x), screenUV.y).add(
+        vec2(tilt.x.negate(), tilt.y.negate())
+          .mul(u.planarDistortion)
+          .mul(min(float(1), float(30).div(dist)))
+      )
+      const step = u.reflectionBlur.div(screenSize).div(3)
+      let sum: any = vec3(0)
+      let total = 0
+      for (let k = -3; k <= 3; k++) {
+        const w = Math.exp(-(k * k) / 4.5)
+        const at = base.add(step.mul(k)).clamp(0.0005, 0.9995)
+        sum = sum.add(planar.sample(at).rgb.mul(w))
+        total += w
+      }
+      reflection = mix(reflection, sum.div(total), onPlane)
+    }
+    // A stylised lake: the reflection pulled toward a slate tint and darkened.
+    reflection = mix(reflection, u.reflectionTint.mul(day), u.reflectionTintAmount).mul(u.reflectionDarken)
 
     // Sun glint: GGX distribution with Schlick Fresnel.
     const H = normalize(L.add(V))
@@ -944,8 +1005,16 @@ export function createWaterMaterial(
     const contactFoam = contact.mul(mix(0.45, 1, foamNoise))
     const foam = max(max(shore, contactFoam), surfaceFoam).mul(u.foam).clamp(0, 1)
 
-    const lit = mix(body, reflection, F.mul(coverage)).add(glint.mul(coverage))
-    return vec4(mix(lit, u.foamColor.mul(day), foam), coverage)
+    // Shoreline: the water darkens over its first metres of depth (the shore's reflection and the bed's shade), and a
+    // stylised band of shore colour marks the waterline a few pixels wide at any distance.
+    const darken = float(1).sub(u.shoreDarkening.mul(float(1).sub(smoothstep(0.2, 2.5, depth))))
+    const lit = mix(body, reflection, F.mul(coverage)).add(glint.mul(coverage)).mul(darken)
+    const shorePixels = depth.div(max(depthStep, 1e-5))
+    const shoreLine = float(1)
+      .sub(smoothstep(u.shoreBandPixels.mul(0.5), u.shoreBandPixels, shorePixels))
+      .mul(u.shoreBand)
+    const shaded = mix(lit, u.shoreBandColor.mul(day), shoreLine)
+    return vec4(mix(shaded, u.foamColor.mul(day), foam), max(coverage, shoreLine))
   })()
 
   return material

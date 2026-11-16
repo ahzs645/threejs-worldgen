@@ -12,6 +12,19 @@ import {
   type TreeParams
 } from 'threejs-trees'
 import { binCrownWidth, binSeed, heightBin, TREE_HEIGHT_LADDER } from './pgmaps-tree-bins'
+import { cappedWidthScale } from './pgmaps-far-forest-math'
+import { snagForm, standingSnagShare } from './pgmaps-burn'
+import { keepStem, stemHash } from './pgmaps-nature'
+
+/**
+ * The grown kind every stem on burnt ground is drawn as (cover 7, pgmaps-burn.ts): a fire-killed snag, bare grey-black
+ * wood with dead branch stubs, whatever its species was.
+ */
+export const SNAG = 'snag'
+/** A snag class's crown (stub reach) as a share of its height, before `binCrownWidth`'s widening. */
+const SNAG_CROWN_RATIO = 0.07
+/** A snag's clear stem below its stubs, as a share of its height. */
+const SNAG_CROWN_BASE = 0.32
 
 /** The stems of a package (`trees` block) and its species table. */
 export interface StandInput {
@@ -126,6 +139,24 @@ function recipe(name: string, h: number, w: number, crownBase: number): TreePara
       )
     case 'birch':
       return sized(presets.birch, { tropism: [0, -0.08, 0], barkColor: '#e0dbd0' }, 'ellipsoid')
+    case SNAG: // a fire-killed stem: a bare charred trunk, a few dead branch stubs, no foliage
+      return sized(
+        presets.deadSnag,
+        {
+          leader: true,
+          tropism: [0, -0.25, 0],
+          jitter: 0.45,
+          attractionPoints: Math.round(Math.min(300, Math.max(80, h * 8))),
+          leafShape: 'none',
+          leafDensity: 0,
+          barkColor: '#463c44',
+          barkContrast: 0.5,
+          barkMarks: 0,
+          baseRadius: Math.min(0.32, Math.max(0.08, h * 0.0095)),
+          tipRadius: 0.025
+        },
+        'cone'
+      )
     default:
       return sized(presets.spruce, {}, 'cone')
   }
@@ -170,18 +201,43 @@ export async function standLayers(
   maxDistance: number,
   onStatus: (text: string) => void,
   /** Package points where no stem is drawn (water). */
-  exclude: (x: number, y: number) => boolean = () => false
-): Promise<{ layers: ScatterLayer[]; stems: number }> {
+  exclude: (x: number, y: number) => boolean = () => false,
+  /**
+   * The far stand: stems farther than `radius` from the package origin are drawn as a fixed set of their class's
+   * impostors standing on `groundAt` (package metres), never streamed, culled or faded by distance, so a capture's
+   * stems kilometres off are all drawn. Without it (or without impostors) every stem goes to the scatter.
+   */
+  far: { radius: number; groundAt: (x: number, y: number) => number } | null = null,
+  /**
+   * Years since the fire where a stem stands on burnt ground (cover 7), else NaN: the stem is drawn as a snag
+   * ({@link SNAG}, its form from `snagForm`), and left out once fallen (`standingSnagShare`).
+   */
+  burntAge: (x: number, y: number) => number = () => NaN
+): Promise<{ layers: ScatterLayer[]; stems: number; snags: number; far: FarStand | null }> {
   const stride = pkg.trees.fields.length
   const data = pkg.trees.data
-  /** Stems by species, then by ladder class. */
-  const bySpecies = new Map<number, Map<number, number[]>>()
+  /** Stems by species (or {@link SNAG}), then by ladder class. */
+  const bySpecies = new Map<string, Map<number, number[]>>()
+  /** A snag's drawn height and crown width, by stem. */
+  const snagged = new Map<number, { height: number; crownWidth: number }>()
   for (let i = 0; i < pkg.trees.count; i++) {
-    if (exclude(data[i * stride], data[i * stride + 1])) continue
-    const s = data[i * stride + 3]
+    const o = i * stride
+    const x = data[o]
+    const y = data[o + 1]
+    if (exclude(x, y)) continue
+    let s = pkg.trees.species[data[o + 3]]
+    let height = data[o + 4]
+    const age = burntAge(x, y)
+    if (Number.isFinite(age)) {
+      if (!keepStem(y, x, standingSnagShare(age))) continue
+      const form = snagForm(height, data[o + 5], stemHash(x, y))
+      snagged.set(i, form)
+      s = SNAG
+      height = form.height
+    }
     let bins = bySpecies.get(s)
     if (!bins) bySpecies.set(s, (bins = new Map()))
-    const bin = heightBin(data[i * stride + 4])
+    const bin = heightBin(height)
     let list = bins.get(bin)
     if (!list) bins.set(bin, (list = []))
     list.push(i)
@@ -190,10 +246,12 @@ export async function standLayers(
   const used = new Set<string>()
   const layers: ScatterLayer[] = []
   let stems = 0
-  for (const [speciesIndex, bins] of bySpecies) {
-    const name = pkg.trees.species[speciesIndex]
-    const crownBase = pkg.species[name]?.crownBase ?? 0.3
-    const crownRatio = pkg.species[name]?.crownRatio
+  const farMeshes: THREE.Mesh[] = []
+  let farStems = 0
+  for (const [name, bins] of bySpecies) {
+    const snag = name === SNAG
+    const crownBase = snag ? SNAG_CROWN_BASE : (pkg.species[name]?.crownBase ?? 0.3)
+    const crownRatio = snag ? SNAG_CROWN_RATIO : pkg.species[name]?.crownRatio
     const key = JSON.stringify([crownBase, crownRatio ?? null, maxDistance])
     let entry = cache.get(name)
     if (entry && entry.key !== key) {
@@ -220,10 +278,20 @@ export async function standLayers(
       if (!built) continue
       const m = built.measured
       const list: number[] = []
+      const farList: number[] = []
+      const farRadius2 = far && built.impostor ? far.radius * far.radius : Infinity
       for (const i of members) {
         const o = i * stride
         const yaw = (data[o + 6] * 6.283185 + data[o] * 0.37) % 6.283185
-        list.push(data[o], -data[o + 1], yaw, data[o + 5] / m.width, data[o + 4] / m.height)
+        const into = data[o] * data[o] + data[o + 1] * data[o + 1] > farRadius2 ? farList : list
+        const form = snagged.get(i)
+        // Never stretched sideways past 1.5 × its grown shape (`cappedWidthScale`): closure is the stand's, not a stem's.
+        const tall = (form ? form.height : data[o + 4]) / m.height
+        into.push(data[o], -data[o + 1], yaw, cappedWidthScale((form ? form.crownWidth : data[o + 5]) / m.width, tall), tall)
+      }
+      if (farList.length && far && built.impostor) {
+        farMeshes.push(farStandMesh(built.impostor, farList, far.groundAt, `${name}@${TREE_HEIGHT_LADDER[bin]}`))
+        farStems += farList.length / FIXED_INSTANCE_STRIDE
       }
       const layer = built.layer
       layer.lods = built.lods
@@ -238,7 +306,72 @@ export async function standLayers(
       retired.push([...entry.bins.values()].map((b) => b.layer))
       cache.delete(name)
     }
-  return { layers, stems }
+  let farStand: FarStand | null = null
+  if (farMeshes.length) {
+    const object = new THREE.Group()
+    object.name = 'far stand'
+    object.add(...farMeshes)
+    farStand = {
+      object,
+      stems: farStems,
+      dispose() {
+        // Never `dispose()`d: each geometry shares the cached class's quad buffers, which a dispose would free while
+        // the class still draws with them (three.js also frees a render object's other attributes). Reclaimed by
+        // garbage collection, as the scatter's retired pools are.
+        object.removeFromParent()
+      }
+    }
+  }
+  return { layers, stems: stems + farStems, snags: snagged.size, far: farStand }
+}
+
+/** The far stand: one impostor mesh per grown class, every stem in it drawn wherever the camera is. */
+export interface FarStand {
+  object: THREE.Group
+  stems: number
+  dispose(): void
+}
+
+/** How far the scatter's colour variation reaches (`layer.colorVariation`, set in `buildBin`). */
+const COLOR_VARIATION = 0.12
+/** How far a stem is sunk into the ground (`layer.sink`, set in `buildBin`). */
+const SINK = 0.05
+
+/**
+ * A class's far stems as its own impostor: the same quad and material the scatter draws past the coarse mesh, fed the
+ * same per-stem attributes the scatter writes (`scatterPosition`: base and height scale; `scatterParams`: yaw, tint,
+ * random, width ÷ height), from a list of `x, z, yaw, width scale, height scale` in three.js axes.
+ */
+function farStandMesh(
+  impostor: NonNullable<ScatterLayer['impostor']>,
+  list: number[],
+  groundAt: (x: number, y: number) => number,
+  name: string
+): THREE.Mesh {
+  const count = list.length / FIXED_INSTANCE_STRIDE
+  const position = new Float32Array(count * 4)
+  const params = new Float32Array(count * 4)
+  for (let n = 0; n < count; n++) {
+    const o = n * FIXED_INSTANCE_STRIDE
+    const [x, z, yaw, width, tall] = [list[o], list[o + 1], list[o + 2], list[o + 3], list[o + 4]]
+    const u = hash(Math.floor(x * 1000), Math.floor(z * 1000), 0x5ca7) / 4294967296
+    position.set([x, groundAt(x, -z) - SINK, z, tall], n * 4)
+    params.set([yaw, 1 + (u * 2 - 1) * COLOR_VARIATION, u, tall > 0 ? width / tall : 1], n * 4)
+  }
+  const source = impostor.geometry
+  const geometry = new THREE.InstancedBufferGeometry()
+  geometry.setIndex(source.index)
+  for (const [key, attribute] of Object.entries(source.attributes)) geometry.setAttribute(key, attribute)
+  geometry.setAttribute('scatterPosition', new THREE.InstancedBufferAttribute(position, 4))
+  geometry.setAttribute('scatterParams', new THREE.InstancedBufferAttribute(params, 4))
+  geometry.instanceCount = count
+  const mesh = new THREE.Mesh(geometry, impostor.material)
+  mesh.name = `${name}:far`
+  mesh.frustumCulled = false
+  mesh.matrixAutoUpdate = false
+  mesh.castShadow = false
+  mesh.receiveShadow = false
+  return mesh
 }
 
 /** Grows one height class of a species. The first class grown sets the materials the species' later classes share. */
@@ -263,7 +396,8 @@ async function buildBin(
     simplifiedDetail: DETAIL.simplified,
     seed,
     renderer,
-    impostor: { size: 1024, frames: 7 },
+    // 7 × 7 views of 128 px: power-of-two cells, so each view keeps its own coverage-preserving mipmaps.
+    impostor: { size: 896, frames: 7, mipmaps: 'coverage' },
     castShadow: true
   })
   // A third, coarse mesh between the simplified one and the impostor: the same tree (the seed
@@ -286,8 +420,8 @@ async function buildBin(
     }
   ]
   if (layer.impostor) layer.impostor.distance = maxDistance
-  layer.colorVariation = 0.12
-  layer.sink = 0.05
+  layer.colorVariation = COLOR_VARIATION
+  layer.sink = SINK
   const box =
     layer.lods[0].geometry.boundingBox ??
     new THREE.Box3().setFromBufferAttribute(layer.lods[0].geometry.attributes.position as THREE.BufferAttribute)

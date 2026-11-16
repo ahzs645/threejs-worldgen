@@ -1,7 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileURLToPath } from 'node:url'
-import { readdirSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 
 const src = (p: string) => fileURLToPath(new URL(`../packages/${p}`, import.meta.url))
 const packages = [
@@ -20,10 +21,27 @@ const packages = [
   'grass',
   'worldgen'
 ]
+/** This checkout's commit (`+dirty` with uncommitted changes) and the threejs-worldgen package version, for replies. */
+function worldgenVersion(): string {
+  const git = (args: string) =>
+    execSync(`git ${args}`, { cwd: fileURLToPath(new URL('..', import.meta.url)) })
+      .toString()
+      .trim()
+  let commit = 'unknown'
+  try {
+    commit = git('rev-parse --short HEAD') + (git('status --porcelain --untracked-files=no') ? '+dirty' : '')
+  } catch {
+    // not a git checkout
+  }
+  const pkg = JSON.parse(readFileSync(new URL('../packages/worldgen/package.json', import.meta.url), 'utf8'))
+  return `${commit} (threejs-worldgen ${pkg.version})`
+}
+
 const name = (dir: string) => (dir === 'worldgen' ? 'threejs-worldgen' : `threejs-${dir}`)
 
 export default defineConfig({
   plugins: [react()],
+  define: { __WORLDGEN_VERSION__: JSON.stringify(worldgenVersion()) },
   // Demos run straight from each package's src/, so edits show up without a build.
   resolve: {
     alias: [

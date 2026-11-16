@@ -32,6 +32,12 @@ export type WeatherKind = 'clear' | 'overcast' | 'rain' | 'snow'
  * scene may be dark.
  */
 export type SunMode = 'true' | 'daylight'
+/**
+ * How the far forest and water are drawn. `'via'`: the consultants' convention (VNS renders): dark olive canopy, crisp
+ * mirror lakes darkened toward slate blue with a thin tan shore band. `'photo'`: a photograph's look: a desaturated
+ * natural canopy, and water rippled by `windMs` reflecting the sky.
+ */
+export type EnvironmentLook = 'via' | 'photo'
 
 /** What the parent sends (`pgmaps-environment`), all optional; missing fields keep their last value. */
 export interface EnvironmentInput {
@@ -52,6 +58,20 @@ export interface EnvironmentInput {
    * it takes for its ephemeris to stand the sun at this elevation, so engines light the same moment alike.
    */
   sunPosition?: { elevationDegrees: number; azimuthDegrees: number } | null
+  /**
+   * Share of the sky under cloud, 0–1 (PGMaps: 1 in overcast, rain and snow). Drawn whatever the weather preset says:
+   * 0 is a sky with no cloud at all, 1 the closed deck. `null` (never sent) keeps the weather preset's own sky.
+   */
+  cloudCover?: number | null
+  /**
+   * Meteorological visibility, km. The haze follows Koschmieder's law: extinction 3.912 / visibility per metre, so a
+   * surface keeps exp(−3.912·d / visibility) of its contrast against the horizon sky. `null` keeps the preset's.
+   */
+  visibilityKm?: number | null
+  /** Wind at the water, m/s: its roughness (Cox–Munk) and ripples; 0 is a mirror. */
+  windMs?: number | null
+  /** See {@link EnvironmentLook}; never sent = `'via'`. */
+  look?: EnvironmentLook
 }
 
 /** The environment in force: `null` date or position means "the package's default". */
@@ -65,6 +85,10 @@ export interface EnvironmentState {
   utc: string | null
   sun: SunMode
   sunPosition: { elevationDegrees: number; azimuthDegrees: number } | null
+  cloudCover: number | null
+  visibilityKm: number | null
+  windMs: number
+  look: EnvironmentLook
 }
 
 export const DEFAULT_ENVIRONMENT: EnvironmentState = {
@@ -76,7 +100,11 @@ export const DEFAULT_ENVIRONMENT: EnvironmentState = {
   timeZone: null,
   utc: null,
   sun: 'daylight',
-  sunPosition: null
+  sunPosition: null,
+  cloudCover: null,
+  visibilityKm: null,
+  windMs: 0,
+  look: 'via'
 }
 
 const SUN_MODES: readonly SunMode[] = ['true', 'daylight']
@@ -113,6 +141,13 @@ export function mergeEnvironment(state: EnvironmentState, input: EnvironmentInpu
   if (given && finite(given.elevationDegrees) && finite(given.azimuthDegrees))
     next.sunPosition = { elevationDegrees: given.elevationDegrees, azimuthDegrees: given.azimuthDegrees }
   else if (given === null || input.utc !== undefined || input.dateTime !== undefined) next.sunPosition = null
+  if (finite(input.cloudCover)) next.cloudCover = Math.max(0, Math.min(1, input.cloudCover))
+  else if (input.cloudCover === null) next.cloudCover = null
+  if (finite(input.visibilityKm) && input.visibilityKm > 0) next.visibilityKm = Math.min(NO_HAZE_KM, input.visibilityKm)
+  else if (input.visibilityKm === null) next.visibilityKm = null
+  if (finite(input.windMs)) next.windMs = Math.max(0, Math.min(20, input.windMs))
+  else if (input.windMs === null) next.windMs = 0
+  if (input.look === 'via' || input.look === 'photo') next.look = input.look
   return next
 }
 
@@ -127,14 +162,30 @@ export function environmentFromParams(params: URLSearchParams): EnvironmentInput
     weather: (params.get('weather') ?? undefined) as WeatherKind | undefined,
     timeZone: params.get('timeZone') ?? undefined,
     utc: params.get('utc') ?? undefined,
-    sun: (params.get('sun') ?? undefined) as SunMode | undefined
+    sun: (params.get('sun') ?? undefined) as SunMode | undefined,
+    cloudCover: number('cloudCover'),
+    visibilityKm: number('visibilityKm'),
+    windMs: number('windMs'),
+    look: (params.get('look') ?? undefined) as EnvironmentLook | undefined
   }
 }
 
 /**
+ * How bright the ground's light is against the sky drawn behind it, on a clear day. threejs-sky's horizon radiance and
+ * the lights it suggests left a sunlit white surface about 1.4× the clear horizon (measured at Gun Lake, sun 53° up:
+ * a cut block's soil against the horizon sky), where a clear day's is about 4×: sunlit white near 30,000 cd/m² against
+ * a horizon of 6,000–10,000. With the airlight then as bright as the ground, a dark forest 4 km off took on most of
+ * the horizon's brightness and a cut block barely stood out from it. The sun, the skylight and the fill are all scaled
+ * by this, so shade keeps its share; the exposure stays the sky's own for the instant (fixed for an environment), so
+ * the sky reads as before and the ground brighter.
+ */
+const CLEAR_GROUND_LIGHT = 2.8
+
+/**
  * How each kind of weather looks. Visibility is the meteorological range (Koschmieder: 2% contrast left), which sets
  * the aerial perspective; `sun` scales the direct light (cloud cover takes it), `fill` is the diffuse skylight under
- * cloud, `exposure` brings a dull day back up the way an eye or camera would.
+ * cloud, `exposure` brings a dull day back up the way an eye or camera would. `light` scales every light on the ground
+ * (sun, skylight, fill) against the sky drawn behind it: see {@link CLEAR_GROUND_LIGHT}.
  */
 const WEATHER: Record<
   WeatherKind,
@@ -150,6 +201,7 @@ const WEATHER: Record<
     /** Brightness of that grey relative to the clear-sky horizon. */
     greyLevel: number
     exposure: number
+    light: number
     wetness: number
     foliageSnow: number
     rain: number
@@ -174,7 +226,8 @@ const WEATHER: Record<
     visibility: 60_000,
     grey: 0,
     greyLevel: 1,
-    exposure: 1.15,
+    exposure: 1,
+    light: CLEAR_GROUND_LIGHT,
     wetness: 0,
     foliageSnow: 0,
     rain: 0,
@@ -200,6 +253,7 @@ const WEATHER: Record<
     grey: 0.85,
     greyLevel: 0.75,
     exposure: 1.9,
+    light: 1,
     wetness: 0.08,
     foliageSnow: 0,
     rain: 0,
@@ -225,6 +279,7 @@ const WEATHER: Record<
     grey: 0.95,
     greyLevel: 0.55,
     exposure: 2.1,
+    light: 1,
     wetness: 0.6,
     foliageSnow: 0,
     rain: 6,
@@ -250,6 +305,7 @@ const WEATHER: Record<
     grey: 0.95,
     greyLevel: 0.8,
     exposure: 1.6,
+    light: 1,
     wetness: 0.3,
     foliageSnow: 0.3,
     rain: 0,
@@ -264,8 +320,19 @@ const WEATHER: Record<
  */
 const DUSK_ELEVATION = -3
 
+/** Visibility, km, from which no haze is drawn at all (PGMaps sends 1000 for "No haze"). */
+const NO_HAZE_KM = 1000
+
+/** Cloud cover from which the sky is drawn as the closed deck rather than threejs-sky's broken cloud. */
+const CLOSED_DECK = 0.95
+
 export interface Atmosphere {
   sky: Sky
+  /**
+   * The baked sky (dome, clouds and deck) as drawn behind the scene, linear radiance; its PMREM is marked stale on
+   * every bake, so water reflecting it (`environment`) shows the very sky of the picture.
+   */
+  skyTexture: THREE.Texture
   /** Wetness and snow for the ground (and anything else not a tree); trees take theirs through `setTreeEnvironment`. */
   states: MaterialStateUniforms
   precipitation: Precipitation
@@ -279,6 +346,12 @@ export interface Atmosphere {
     /** That instant in `state.timeZone`, when one was given. */
     localDate: string | null
     sunElevation: number
+    /** Share of the sky drawn under cloud, 0–1 (0: none drawn; 1: the closed deck). */
+    cloudCover: number
+    /** Visibility the haze was drawn with, km (Koschmieder: extinction 3.912 / visibility). */
+    visibilityKm: number
+    /** Whether any haze was drawn: false from {@link NO_HAZE_KM} up. */
+    haze: boolean
   }
   /**
    * The sun asked for and the sun drawn, degrees (to 0.1): `elevation`/`azimuth` at the requested instant,
@@ -326,9 +399,10 @@ export async function createAtmosphere(
     longitude: number,
     date: number,
     w: (typeof WEATHER)[WeatherKind],
-    ground: number
+    ground: number,
+    cloudSettings: Record<string, unknown> = w.clouds
   ) => {
-    const clouds = structuredClone(w.clouds) as Record<string, { altitude?: number[] } | unknown>
+    const clouds = structuredClone(cloudSettings) as Record<string, { altitude?: number[] } | unknown>
     const lift = (genus: string, fallback: [number, number]) => {
       const g = (clouds[genus] ?? {}) as { altitude?: number[] }
       const [lo, hi] = g.altitude ?? fallback
@@ -347,9 +421,9 @@ export async function createAtmosphere(
         autoExposure: false,
         fog: false,
         lightDistance: 220,
-        sunIntensity: 3.4 * w.sun,
+        sunIntensity: 3.4 * w.sun * w.light,
         shadows: w.shadows,
-        environmentIntensity: w.environment
+        environmentIntensity: w.environment * w.light
       },
       shootingStars: { rate: 0, shower: 0 },
       clouds: { steps: 64, lightSteps: 6, ...clouds }
@@ -443,7 +517,10 @@ export async function createAtmosphere(
     longitude: -122.6,
     date: '',
     localDate: null,
-    sunElevation: 0
+    sunElevation: 0,
+    cloudCover: WEATHER.clear.clouds.coverage as number,
+    visibilityKm: WEATHER.clear.visibility / 1000,
+    haze: true
   }
   const sunRecord: SunRecord = {
     elevation: 0,
@@ -482,7 +559,16 @@ export async function createAtmosphere(
     sunRecord.clockShiftMinutes = tenth((time - asked) / 60)
     sunRecord.mode = next.sun
     const ground = Math.max(0, Math.round(camera.position.y / 50) * 50)
-    sky.reset(skyInput(latitude, longitude, Math.round(Date.UTC(2000, 0, 1, 12) + time * 1000), look, ground))
+    // The cloud asked for, whatever the weather preset draws: none at 0, the closed deck from CLOSED_DECK up, and
+    // threejs-sky's broken cloud (its `coverage` is the share of the sky covered) in between.
+    const presetCover = next.weather === 'clear' ? (look.clouds.coverage as number) : 1
+    const cover = next.cloudCover ?? presetCover
+    const closed = cover >= CLOSED_DECK
+    const open = !closed && cover > 0.005
+    const cloudSettings = { ...(next.weather === 'clear' ? look.clouds : WEATHER.clear.clouds), coverage: cover }
+    sky.reset(
+      skyInput(latitude, longitude, Math.round(Date.UTC(2000, 0, 1, 12) + time * 1000), look, ground, cloudSettings)
+    )
     sky.update(0)
     applied.state = next
     applied.latitude = latitude
@@ -496,11 +582,16 @@ export async function createAtmosphere(
     sunRecord.drawnElevation = tenth(sky.state.sunElevation)
     sunRecord.drawnAzimuth = tenth(sky.state.sunAzimuth)
     takeSky() // a rebuilt dome goes back under the sky's own root
-    const dull = next.weather !== 'clear'
-    deck.visible = dull
-    sky.clouds.object.visible = !dull
+    deck.visible = closed
+    sky.clouds.object.visible = open
+    applied.cloudCover = closed ? 1 : open ? Math.round(cover * 1000) / 1000 : 0
     bakeSky = true
-    extinction.value = 3.912 / look.visibility
+    // Koschmieder: a surface d metres off keeps exp(−σd) of its contrast against the horizon sky, σ = 3.912 / V.
+    const visibility = next.visibilityKm !== null ? next.visibilityKm * 1000 : look.visibility
+    // From NO_HAZE_KM up the haze is off: no extinction at all, so nothing blends toward the sky (PGMaps' "No haze").
+    applied.haze = visibility < NO_HAZE_KM * 1000
+    extinction.value = applied.haze ? 3.912 / visibility : 0
+    applied.visibilityKm = Math.round(visibility) / 1000
 
     const snowGround = next.ground === 'snow'
     states.snow.value = snowGround ? 1 : 0
@@ -524,11 +615,11 @@ export async function createAtmosphere(
     const lighting = sky.lighting
     if (!lighting) return
     const day = THREE.MathUtils.smoothstep(sky.state.sunElevation, -6, 12)
-    // The haze: the sky's horizon radiance, a little less saturated than the sky itself (low-altitude aerosol
-    // scatters white), turned grey under cloud.
+    // The haze: Koschmieder's airlight is the horizon sky, so a far slope fades into the very colour of the sky
+    // behind it (not a greyed copy, which read every far slope as flat grey); turned grey under cloud.
     const [r, g, b] = lighting.fogColor
     const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    _c.setRGB(r, g, b).lerp(_grey.setRGB(lum, lum, lum), 0.35)
+    _c.setRGB(r, g, b)
     if (look.grey > 0) _c.lerp(_grey.setRGB(lum, lum * 1.01, lum * 1.03).multiplyScalar(look.greyLevel), look.grey)
     hazeColor.value.copy(_c)
     deckColor.value.copy(_c).multiplyScalar(1.15)
@@ -538,7 +629,7 @@ export async function createAtmosphere(
     // Bounce light and the cloud deck's light fade with the daylight; in 'true' mode they go out at night, leaving the
     // sky's own moon and night fill.
     const trueSun = state.sun === 'true'
-    fill.intensity = look.fill * (trueSun ? day : 0.1 + 0.9 * day)
+    fill.intensity = look.fill * look.light * (trueSun ? day : 0.1 + 0.9 * day)
     fill.visible = fill.intensity > 1e-3
     // 'daylight' clamps the sky's exposure suggestion to a day range; 'true' keeps the sky's own figure, and the dull
     // weather's lift (a camera opening up under cloud) fades out with the daylight instead of brightening the night.
@@ -550,6 +641,7 @@ export async function createAtmosphere(
 
   return {
     sky,
+    skyTexture: skyTarget.texture,
     states,
     precipitation,
     applied,
@@ -574,6 +666,7 @@ export async function createAtmosphere(
         skyCamera.updateMatrixWorld()
         const target = renderer.getRenderTarget()
         skyCamera.update(renderer, skyScene)
+        skyTarget.texture.needsPMREMUpdate = true
         renderer.setRenderTarget(target)
       }
       precipitation.update(seconds)
