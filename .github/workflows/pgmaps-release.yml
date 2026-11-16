@@ -1,0 +1,67 @@
+name: Release the PGMaps scene page
+
+# Tags are `pgmaps-scene-v<semver>`, e.g. `pgmaps-scene-v1.0.0`. They carry no `@`, so release.yml (`*@[0-9]*`, npm
+# packages) never runs for them. The Release is the archive; browsers cannot load files from a Release asset (no CORS),
+# so this then starts pages.yml, which unpacks every such Release to /pgmaps/<version>/.
+on:
+  push:
+    tags: ['pgmaps-scene-v[0-9]*']
+
+permissions:
+  contents: write # create the GitHub release
+  actions: write # start the Pages workflow
+
+concurrency:
+  group: pgmaps-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # the suite takes about a minute; a hang should fail fast, not run for hours
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Version from the tag
+        run: |
+          version="${GITHUB_REF_NAME#pgmaps-scene-v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not pgmaps-scene-v<semver>"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # The PGMaps scene page alone (example/vite.config.ts), with relative paths so it works from any directory.
+      - name: Build the page
+        run: npx vite build example --base ./ --outDir ../dist-pgmaps --emptyOutDir
+        env:
+          PGMAPS_SCENE_ONLY: '1'
+          PGMAPS_SCENE_VERSION: ${{ env.VERSION }}
+      - name: Zip it
+        run: |
+          commit="$(git rev-parse --short HEAD)"
+          echo "COMMIT=$commit" >> "$GITHUB_ENV"
+          grep -q "pgmaps-scene $VERSION+$commit" -r dist-pgmaps/assets || { echo "::error::the page does not report pgmaps-scene $VERSION+$commit"; exit 1; }
+          node -e 'const [version, tag, commit] = process.argv.slice(1); process.stdout.write(JSON.stringify({ version, tag, commit, page: `pgmaps-scene ${version}+${commit}`, date: new Date().toISOString() }, null, 2) + "\n")' \
+            "$VERSION" "$GITHUB_REF_NAME" "$commit" > dist-pgmaps/release.json
+          (cd dist-pgmaps && zip -qr "../pgmaps-scene-$VERSION.zip" .)
+      - name: Create the release
+        run: |
+          url="https://projects.ahmadjalil.com/threejs-worldgen/pgmaps/$VERSION/pgmaps-scene.html"
+          gh release create "$GITHUB_REF_NAME" "pgmaps-scene-$VERSION.zip" --verify-tag \
+            --title "PGMaps scene page $VERSION" \
+            --notes "The PGMaps scene page (\`example/pgmaps-scene.html\`) built from commit $COMMIT. It reports \`pgmaps-scene $VERSION+$COMMIT\` as its capture version.
+
+          Served at $url (PGMaps embeds \`$url?embed\`) once the Pages workflow has deployed it; \`pgmaps/versions.json\` lists every served version.
+
+          The zip is the built page with relative paths: unpack it anywhere and serve the directory."
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Deploy it to Pages
+        run: gh workflow run pages.yml --ref main -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}

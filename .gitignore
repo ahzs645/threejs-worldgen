@@ -14,3 +14,5 @@ site
 .prove-it/audits/
 .prove-it/server.log
 .prove-it/server.pid
+dist-pgmaps
+pgmaps-scene-*.zip

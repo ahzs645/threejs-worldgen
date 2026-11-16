@@ -7,7 +7,7 @@
 // docs map on the docs home must link every public package's API modules and every demo page in example/.
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { join, resolve, relative, dirname } from 'node:path'
+import { join, resolve, relative, dirname, sep } from 'node:path'
 import { SITE } from './seo.mjs'
 import { missingFromMap, workspacePackages, demoPages } from './readme-cards.mjs'
 
@@ -16,7 +16,9 @@ const site = resolve(root, process.argv[2] ?? 'site')
 const errors = []
 const walk = (d) =>
   readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]))
-const files = walk(site)
+// site/pgmaps/<version>/ holds the PGMaps scene page's released builds, unpacked as built (pages.yml): archives for an
+// iframe, deliberately left out of the sitemap and without SEO tags, so they are not checked. /demo/ is the moving latest.
+const files = walk(site).filter((f) => !relative(site, f).startsWith(`pgmaps${sep}`))
 const pages = files.filter((f) => f.endsWith('.html'))
 
 // A site URL or a path relative to `from` -> the built file it serves, or null when it doesn't exist.

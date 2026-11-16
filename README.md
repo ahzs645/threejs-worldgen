@@ -120,6 +120,29 @@ first. Packages marked `"private": true` and versions already on npm are skipped
 authenticates with `NPM_TOKEN` if that's set, otherwise your `npm login`, otherwise it asks. Set `NPM_OTP` if your
 account requires a 2FA code to publish. It doesn't create tags or GitHub releases.
 
+### The PGMaps scene page
+
+`example/pgmaps-scene.html` is versioned on its own, for PGMaps, which embeds it in an iframe by URL. Tags are
+`pgmaps-scene-v<semver>` (no `@`, so `release.yml` ignores them):
+
+```bash
+git tag pgmaps-scene-v1.0.1 && git push origin pgmaps-scene-v1.0.1
+```
+
+The tag starts `.github/workflows/pgmaps-release.yml`: typecheck and tests, then a build of that page alone
+(`PGMAPS_SCENE_ONLY=1`, `--base ./`), zipped as `pgmaps-scene-<version>.zip` on a GitHub Release, and then it starts
+`pages.yml`. A browser cannot load a Release asset (no CORS), so `pages.yml` unpacks every such Release to
+`/pgmaps/<version>/` and writes `/pgmaps/versions.json`. A released page is served at
+
+```
+https://projects.ahmadjalil.com/threejs-worldgen/pgmaps/<version>/pgmaps-scene.html?embed
+```
+
+and reports `pgmaps-scene <version>+<commit>` as its capture reply's `version`. `/demo/pgmaps-scene.html` is the
+moving latest from `main` and reports `pgmaps-scene <threejs-worldgen version>-dev+<commit>` (`-dirty` with
+uncommitted changes). Never put a scene package in `example/public/`: it is untracked and the release build leaves
+`public/` out.
+
 ## License
 
 Apache-2.0

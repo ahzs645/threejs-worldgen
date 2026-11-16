@@ -21,27 +21,40 @@ const packages = [
   'grass',
   'worldgen'
 ]
-/** This checkout's commit (`+dirty` with uncommitted changes) and the threejs-worldgen package version, for replies. */
-function worldgenVersion(): string {
+/**
+ * What the PGMaps scene page reports as its capture reply's `version`: `pgmaps-scene <version>+<commit>`. A release
+ * build (`.github/workflows/pgmaps-release.yml`) passes the tag's version in `PGMAPS_SCENE_VERSION`; any other build
+ * reports the threejs-worldgen package version marked `-dev`. The commit is this checkout's, `-dirty` with uncommitted
+ * changes to tracked files.
+ */
+function pgmapsSceneVersion(): string {
   const git = (args: string) =>
-    execSync(`git ${args}`, { cwd: fileURLToPath(new URL('..', import.meta.url)) })
+    execSync(`git ${args}`, {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
       .toString()
       .trim()
   let commit = 'unknown'
   try {
-    commit = git('rev-parse --short HEAD') + (git('status --porcelain --untracked-files=no') ? '+dirty' : '')
+    commit = git('rev-parse --short HEAD') + (git('status --porcelain --untracked-files=no') ? '-dirty' : '')
   } catch {
     // not a git checkout
   }
   const pkg = JSON.parse(readFileSync(new URL('../packages/worldgen/package.json', import.meta.url), 'utf8'))
-  return `${commit} (threejs-worldgen ${pkg.version})`
+  return `pgmaps-scene ${process.env.PGMAPS_SCENE_VERSION || `${pkg.version}-dev`}+${commit}`
 }
+
+// `PGMAPS_SCENE_ONLY=1` builds the PGMaps scene page alone, without public/ (its textures are other demos', and local
+// scene packages there must never ship): the release workflow zips that build.
+const pgmapsOnly = process.env.PGMAPS_SCENE_ONLY === '1'
 
 const name = (dir: string) => (dir === 'worldgen' ? 'threejs-worldgen' : `threejs-${dir}`)
 
 export default defineConfig({
   plugins: [react()],
-  define: { __WORLDGEN_VERSION__: JSON.stringify(worldgenVersion()) },
+  define: { __WORLDGEN_VERSION__: JSON.stringify(pgmapsSceneVersion()) },
+  ...(pgmapsOnly ? { publicDir: false as const } : {}),
   // Demos run straight from each package's src/, so edits show up without a build.
   resolve: {
     alias: [
@@ -60,7 +73,9 @@ export default defineConfig({
   build: {
     target: 'esnext',
     rollupOptions: {
-      input: readdirSync(fileURLToPath(new URL('.', import.meta.url))).filter((f) => f.endsWith('.html'))
+      input: pgmapsOnly
+        ? ['pgmaps-scene.html']
+        : readdirSync(fileURLToPath(new URL('.', import.meta.url))).filter((f) => f.endsWith('.html'))
     }
   }
 })

@@ -28,6 +28,20 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build:site
+      # Every released PGMaps scene page (pgmaps-release.yml) at /pgmaps/<version>/, beside /demo/pgmaps-scene.html,
+      # the moving latest. A Release asset cannot be loaded by a browser (no CORS), so Pages serves each one.
+      - name: Unpack the PGMaps scene page releases
+        run: |
+          mkdir -p site/pgmaps
+          for tag in $(gh release list -R "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName | select(startswith("pgmaps-scene-v"))'); do
+            version="${tag#pgmaps-scene-v}"
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" --pattern "pgmaps-scene-$version.zip" --dir "$RUNNER_TEMP/pgmaps"
+            unzip -q "$RUNNER_TEMP/pgmaps/pgmaps-scene-$version.zip" -d "site/pgmaps/$version"
+          done
+          node scripts/pgmaps-versions.mjs site/pgmaps
+          node landing/check.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
