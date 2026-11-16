@@ -15,4 +15,5 @@ site
 .prove-it/server.log
 .prove-it/server.pid
 dist-pgmaps
+dist-pgmaps-worker
 pgmaps-scene-*.zip

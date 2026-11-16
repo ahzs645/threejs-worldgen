@@ -62,6 +62,7 @@
 import * as THREE from 'three/webgpu'
 import { pass } from 'three/tsl'
 import { bloom } from 'three/addons/tsl/display/BloomNode.js'
+import { host } from './pgmaps-host'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { Scatter } from 'threejs-scatter'
 import {
@@ -109,27 +110,34 @@ type PackageCamera = {
 }
 
 const ENGINE = 'worldgen'
+// (a worker's location is its script's address, with the options PGMaps put on it: `?embed`)
 const params = new URLSearchParams(location.search)
-const embedded = params.has('embed')
-const hud = document.getElementById('hud')!
-if (embedded) hud.hidden = true
-const status = (text: string) => {
-  hud.textContent = text
-}
-const toParent = (message: Record<string, unknown>) => {
-  if (window.parent !== window) window.parent.postMessage({ engine: ENGINE, ...message }, '*')
-}
+const embedded = host.embedded
+const status = (text: string) => host.status(text)
+const toParent = (message: Record<string, unknown>, transfer: Transferable[] = []) =>
+  host.post({ engine: ENGINE, ...message }, transfer)
+/** The global state for checking from the page (`window.pgmaps`; the worker's global in a worker). */
+const pageState = <T = Record<string, unknown>>() => host.state<T>()
 
 // ---------------------------------------------------------------- the renderer, camera and sky: made once
-const renderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: params.has('webgl') })
-renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5))
-renderer.setSize(innerWidth, innerHeight)
-document.body.appendChild(renderer.domElement)
+// (in a worker, once PGMaps has handed over the canvas)
+await host.ready
+const view0 = host.viewport()
+const renderer = new THREE.WebGPURenderer({ canvas: host.canvas(), antialias: true, forceWebGL: params.has('webgl') })
+renderer.setPixelRatio(Math.min(view0.pixelRatio, 1.5))
+// (an OffscreenCanvas has no style to size: PGMaps sizes and places the element it handed over)
+renderer.setSize(view0.width, view0.height, !host.worker)
+host.mount(renderer.domElement)
 await renderer.init()
 
 const scene = new THREE.Scene()
-const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.3, 8000) // LIVE_FAR
-const controls = new OrbitControls(camera, renderer.domElement)
+const camera = new THREE.PerspectiveCamera(40, view0.width / view0.height, 0.3, 8000) // LIVE_FAR
+// OrbitControls' update turns the camera to its target even when disabled: that is what aims the parent's eye, so the
+// worker's stand-in (no DOM events there) does the same.
+const orbitTarget = new THREE.Vector3()
+const controls: { enabled: boolean; target: THREE.Vector3; update: () => unknown } = host.worker
+  ? { enabled: false, target: orbitTarget, update: () => camera.lookAt(orbitTarget) }
+  : new OrbitControls(camera, renderer.domElement as HTMLCanvasElement)
 if (embedded) controls.enabled = false
 const atmosphere = await createAtmosphere(renderer, scene, camera)
 
@@ -148,24 +156,29 @@ const applyEnvironment = () => {
   current?.farForest.setLook(environment.look)
   current?.ground.setLook(environment.look)
   current?.ground.water?.setLook(environment.look, environment.windMs)
-  const state = (window as unknown as { pgmaps?: Record<string, unknown> }).pgmaps
+  const state = pageState()
   if (state) state.environment = { ...atmosphere.applied }
 }
 applyEnvironment()
 
 let savedProjection: CameraProjection | undefined
-let viewWidth = innerWidth
-let viewHeight = innerHeight
+let viewWidth = view0.width
+let viewHeight = view0.height
 const resize = () => {
-  const view = fitCameraViewport(savedProjection, innerWidth, innerHeight)
+  const box = host.viewport()
+  const view = fitCameraViewport(savedProjection, box.width, box.height)
   camera.aspect = view.aspect
   camera.updateProjectionMatrix()
+  if (Math.min(box.pixelRatio, 1.5) !== renderer.getPixelRatio()) {
+    renderer.setPixelRatio(Math.min(box.pixelRatio, 1.5))
+    viewWidth = 0 // (the drawing buffer changes size with it)
+  }
   if (viewWidth !== view.width || viewHeight !== view.height) {
-    renderer.setSize(view.width, view.height)
+    renderer.setSize(view.width, view.height, !host.worker)
     viewWidth = view.width
     viewHeight = view.height
   }
-  Object.assign(renderer.domElement.style, { position: 'absolute', left: `${view.left}px`, top: `${view.top}px` })
+  host.place(renderer.domElement, view)
 }
 
 /** Stands the camera at a package eye: position in package metres, bearing clockwise from north, pitch up. */
@@ -393,8 +406,8 @@ async function captureForPage(request?: CaptureRequest, options: { size?: [numbe
     frames: reply.frames.map((f, i) => ({ width: f.width, height: f.height, camera: f.camera, urls: urls[i] })),
     check
   }
-  const state = (window as unknown as { pgmaps: Record<string, unknown> }).pgmaps
-  state.lastCapture = { ...summary, reply }
+  const state = pageState()
+  if (state) state.lastCapture = { ...summary, reply }
   return summary
 }
 
@@ -406,7 +419,10 @@ async function captureForPage(request?: CaptureRequest, options: { size?: [numbe
 function syntheticStandFor(request: CaptureRequest, density = 800) {
   if (!current) throw new Error('No scene is loaded.')
   const { pkg, farForest, ground } = current
-  const spans = request.frames.map((f) => [f.bearingDegrees - f.horizontalFovDegrees / 2 - 2, f.bearingDegrees + f.horizontalFovDegrees / 2 + 2])
+  const spans = request.frames.map((f) => [
+    f.bearingDegrees - f.horizontalFovDegrees / 2 - 2,
+    f.bearingDegrees + f.horizontalFovDegrees / 2 + 2
+  ])
   const first = spans[0][0]
   const unwrap = (b: number) => first + ((((b - first) % 360) + 540) % 360) - 180
   const from = Math.min(...spans.map(([a]) => unwrap(a)))
@@ -429,7 +445,7 @@ function syntheticStandFor(request: CaptureRequest, density = 800) {
 if (params.has('captureTest')) {
   void (async () => {
     // Polls from module load, before `window.pgmaps` exists.
-    const state = () => (window as unknown as { pgmaps?: { ready?: boolean } }).pgmaps
+    const state = () => pageState<{ ready?: boolean }>()
     while (!state()?.ready || !current) await new Promise((resolve) => setTimeout(resolve, 200))
     try {
       let asked: CaptureRequest | undefined
@@ -444,7 +460,8 @@ if (params.has('captureTest')) {
       status(`capture test: ${summary.ms} ms, ${(summary.check.offShare * 100).toFixed(2)}% of ground pixels off class`)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      ;(window as unknown as { pgmaps: Record<string, unknown> }).pgmaps.lastCapture = { error: message }
+      const state = pageState()
+      if (state) state.lastCapture = { error: message }
       status(`capture test failed: ${message}`)
     }
   })()
@@ -511,7 +528,7 @@ async function load(pkg: ScenePackage) {
       setCamera(parentCamera ?? next.camera)
       framesSinceBuild = 0
       announced = false
-      Object.assign(window, {
+      host.expose({
         pgmaps: {
           scene,
           camera,
@@ -534,7 +551,7 @@ async function load(pkg: ScenePackage) {
     const message = error instanceof Error ? error.message : String(error)
     status(`failed: ${message}`)
     toParent({ type: 'pgmaps-engine-error', message })
-    Object.assign(window, { pgmaps: { ready: true, error: message } })
+    host.expose({ pgmaps: { ready: true, error: message } })
   } finally {
     building = false
   }
@@ -567,45 +584,49 @@ addEventListener('message', (event: MessageEvent) => {
     if (current) setCamera(parentCamera)
   } else if (data?.type === 'pgmaps-capture') {
     const request = event.data as CaptureRequest
-    const source = (event.source as Window | null) ?? window.parent
+    // (the reply goes back the way the request came: to the page that sent it, or to PGMaps from a worker)
+    const source = event.source as Window | null
     const targetOrigin = event.origin && event.origin !== 'null' ? event.origin : '*'
+    const reply = (message: Record<string, unknown>, transfer: Transferable[] = []) =>
+      source ? source.postMessage(message, { targetOrigin, transfer }) : host.post(message, transfer)
     // Always a reply, and before PGMaps' own 180 s timeout: a capture that has not finished by the watchdog is answered
     // with an error (its late result is dropped).
     let answered = false
     const watchdog = setTimeout(() => {
       answered = true
-      source.postMessage(
-        { type: 'pgmaps-engine-capture', id: request.id, error: `The capture took longer than ${CAPTURE_WATCHDOG_MS / 1000} s.` },
-        { targetOrigin }
-      )
+      reply({
+        type: 'pgmaps-engine-capture',
+        id: request.id,
+        error: `The capture took longer than ${CAPTURE_WATCHDOG_MS / 1000} s.`
+      })
     }, CAPTURE_WATCHDOG_MS)
     // Steps done of the total while it renders, for PGMaps' time-left estimate (dropped once answered).
     const progress = (done: number, total: number, stage: string) => {
-      if (!answered) source.postMessage({ type: 'pgmaps-capture-progress', id: request.id, done, total, stage }, { targetOrigin })
+      if (!answered) reply({ type: 'pgmaps-capture-progress', id: request.id, done, total, stage })
     }
-    capturer.capture(request, progress).finally(() => clearTimeout(watchdog)).then(
-      (reply) => {
-        // What the parent got, for checking from the page (`window.pgmaps.lastCapture`); buffers are transferred.
-        const state = (window as unknown as { pgmaps?: Record<string, unknown> }).pgmaps
-        if (state)
-          state.lastCapture = {
-            ...capturer.lastSummary,
-            request: { id: request.id, position: request.position, frames: request.frames, classes: request.classes }
-          }
-        if (!answered) source.postMessage(reply, { targetOrigin, transfer: transferOf(reply) })
-        answered = true
-      },
-      (error) =>
-        !answered &&
-        source.postMessage(
-          {
+    capturer
+      .capture(request, progress)
+      .finally(() => clearTimeout(watchdog))
+      .then(
+        (result) => {
+          // What the parent got, for checking from the page (`window.pgmaps.lastCapture`); buffers are transferred.
+          const state = pageState()
+          if (state)
+            state.lastCapture = {
+              ...capturer.lastSummary,
+              request: { id: request.id, position: request.position, frames: request.frames, classes: request.classes }
+            }
+          if (!answered) reply(result as unknown as Record<string, unknown>, transferOf(result))
+          answered = true
+        },
+        (error) =>
+          !answered &&
+          reply({
             type: 'pgmaps-engine-capture',
             id: request.id,
             error: error instanceof Error ? error.message : String(error)
-          },
-          { targetOrigin }
-        )
-    )
+          })
+      )
   } else if (data?.type === 'pgmaps-environment') {
     environmentOverridden = true
     // Light, sky and weather only: the stand and ground stay as built.
@@ -625,7 +646,7 @@ async function fromUrlOrFile(): Promise<ScenePackage> {
   })
 }
 
-Object.assign(window, {
+host.expose({
   pgmaps: {
     scene,
     camera,
@@ -723,7 +744,7 @@ renderer.setAnimationLoop(() => {
   )
   framesSinceBuild += 1
   if (framesSinceBuild === 3) current.scatter.set({ cullMargin: CULL_MARGIN })
-  const state = (window as unknown as { pgmaps: { ready: boolean } }).pgmaps
+  const state = pageState<{ ready: boolean }>() ?? { ready: false }
   const streamed = s.instances >= current.stems
   // A (new) scene's first full frame: every stem streamed in, or long enough that the rest are out of reach.
   if (!announced && framesSinceBuild > 2 && (streamed || framesSinceBuild > 120)) {
@@ -756,6 +777,7 @@ renderer.setAnimationLoop(() => {
     state.ready = true
   } else if (!params.has('still') && framesSinceBuild === 60) state.ready = true
 })
+// (a worker is ended, not unloaded: its GPU device goes with it)
 addEventListener('beforeunload', () => {
   capturer.dispose()
   current?.dispose()
@@ -763,4 +785,4 @@ addEventListener('beforeunload', () => {
   disposeFarForestAtlases()
   atmosphere.dispose()
 })
-addEventListener('resize', resize)
+host.onResize(resize)

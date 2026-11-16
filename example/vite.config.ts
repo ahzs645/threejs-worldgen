@@ -48,13 +48,16 @@ function pgmapsSceneVersion(): string {
 // `PGMAPS_SCENE_ONLY=1` builds the PGMaps scene page alone, without public/ (its textures are other demos', and local
 // scene packages there must never ship): the release workflow zips that build.
 const pgmapsOnly = process.env.PGMAPS_SCENE_ONLY === '1'
+// `PGMAPS_SCENE_WORKER=1` (npm run build:pgmaps-worker) builds the same scene as a worker PGMaps starts itself
+// (pgmaps-worker.ts), to pgmaps-engine.js: PGMaps builds it from its vendor/threejs-worldgen submodule.
+const pgmapsWorker = process.env.PGMAPS_SCENE_WORKER === '1'
 
 const name = (dir: string) => (dir === 'worldgen' ? 'threejs-worldgen' : `threejs-${dir}`)
 
 export default defineConfig({
   plugins: [react()],
   define: { __WORLDGEN_VERSION__: JSON.stringify(pgmapsSceneVersion()) },
-  ...(pgmapsOnly ? { publicDir: false as const } : {}),
+  ...(pgmapsOnly || pgmapsWorker ? { publicDir: false as const } : {}),
   // Demos run straight from each package's src/, so edits show up without a build.
   resolve: {
     alias: [
@@ -72,10 +75,17 @@ export default defineConfig({
   worker: { format: 'es' },
   build: {
     target: 'esnext',
-    rollupOptions: {
-      input: pgmapsOnly
-        ? ['pgmaps-scene.html']
-        : readdirSync(fileURLToPath(new URL('.', import.meta.url))).filter((f) => f.endsWith('.html'))
-    }
+    // (a worker has no document for module preloads to add links to)
+    ...(pgmapsWorker ? { modulePreload: false as const } : {}),
+    rollupOptions: pgmapsWorker
+      ? {
+          input: { 'pgmaps-engine': fileURLToPath(new URL('./pgmaps-worker.ts', import.meta.url)) },
+          output: { entryFileNames: '[name].js' }
+        }
+      : {
+          input: pgmapsOnly
+            ? ['pgmaps-scene.html']
+            : readdirSync(fileURLToPath(new URL('.', import.meta.url))).filter((f) => f.endsWith('.html'))
+        }
   }
 })
