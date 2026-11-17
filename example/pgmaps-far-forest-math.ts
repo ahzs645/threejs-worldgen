@@ -55,7 +55,17 @@ import { contentHash } from './pgmaps-capture-math.ts'
 // ---------------------------------------------------------------- tree silhouettes
 
 /** The silhouette families drawn: one per PGMaps species. */
-export const SPECIES_ORDER = ['pine', 'spruce', 'fir', 'douglasFir', 'aspen', 'birch'] as const
+export const SPECIES_ORDER = [
+  'pine',
+  'spruce',
+  'fir',
+  'douglasFir',
+  'aspen',
+  'birch',
+  'hemlock',
+  'blackSpruce',
+  'cottonwood'
+] as const
 export type SpeciesName = (typeof SPECIES_ORDER)[number]
 /** Species index into {@link SPECIES_ORDER}; unknown species draw as spruce. */
 export const speciesSlot = (name: string): number => {
@@ -82,6 +92,9 @@ export const SILHOUETTE_CROWN_RATIO: Record<SpriteKind, number> = {
   douglasFir: 0.24,
   aspen: 0.3,
   birch: 0.28,
+  hemlock: 0.2,
+  blackSpruce: 0.14,
+  cottonwood: 0.36,
   snag: 0.1
 }
 /**
@@ -90,13 +103,16 @@ export const SILHOUETTE_CROWN_RATIO: Record<SpriteKind, number> = {
  */
 const DENSITY_CROWN_RATIO: Record<SpriteKind, number> = { ...SILHOUETTE_CROWN_RATIO, snag: 0.2 }
 /** Share of the height that is clear stem below the crown. */
-const CROWN_BASE: Record<SpeciesName, number> = {
+export const CROWN_BASE: Record<SpeciesName, number> = {
   pine: 0.5,
   spruce: 0.12,
   fir: 0.1,
   douglasFir: 0.25,
   aspen: 0.42,
-  birch: 0.45
+  birch: 0.45,
+  hemlock: 0.16,
+  blackSpruce: 0.12,
+  cottonwood: 0.38
 }
 
 /**
@@ -172,7 +188,7 @@ export function silhouette(species: SpriteKind, u: number, v: number, seed: numb
   const out: SilhouetteSample = { inside: false, albedo: 0, nx: 0, ny: 0 }
   if (v < 0 || v > 1) return out
   const base = CROWN_BASE[species]
-  const broadleaf = species === 'aspen' || species === 'birch'
+  const broadleaf = species === 'aspen' || species === 'birch' || species === 'cottonwood'
   // The stem below the crown: a thin dark line (sub-pixel far off).
   if (v < base + 0.02) {
     if (Math.abs(u) < 0.09) {
@@ -362,7 +378,13 @@ export function patchStems(
       const py = y + random() * cell
       if (px * px + py * py > radius * radius) continue
       const height = standHeight * (0.8 + 0.4 * random())
-      stems.push({ x: px, y: py, height, crown: crownRatio * height * (0.85 + 0.3 * random()), seed: Math.floor(random() * 1e6) })
+      stems.push({
+        x: px,
+        y: py,
+        height,
+        crown: crownRatio * height * (0.85 + 0.3 * random()),
+        seed: Math.floor(random() * 1e6)
+      })
     }
   return stems
 }
@@ -612,7 +634,10 @@ export function syntheticStand(
         let s = 0
         while (s < mix.length - 1 && pick > mix[s].share) pick -= mix[s++].share
         const height = mix[s].height * (0.75 + 0.5 * random())
-        const crown = (SILHOUETTE_CROWN_RATIO[(SPECIES_ORDER as readonly string[]).includes(mix[s].species) ? (mix[s].species as SpeciesName) : 'spruce'] ?? 0.2) * height
+        const crown =
+          (SILHOUETTE_CROWN_RATIO[
+            (SPECIES_ORDER as readonly string[]).includes(mix[s].species) ? (mix[s].species as SpeciesName) : 'spruce'
+          ] ?? 0.2) * height
         out.push(x, y, groundAt(x, y), s, height, crown, random())
       }
     }

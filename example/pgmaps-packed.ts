@@ -5,7 +5,13 @@
 // takes them in its hello (`ACCEPTS`); a plain package passes through untouched. No DOM, no GPU.
 
 /** What this engine's hello tells PGMaps it takes beyond the plain protocol. */
-export const ACCEPTS = ['packed-arrays', 'scene-keys'] as const
+export const ACCEPTS = [
+  'packed-arrays',
+  'scene-keys',
+  'stand-components-v1',
+  'stand-fields-v1',
+  'render-options-v1'
+] as const
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value) && !ArrayBuffer.isView(value)

@@ -143,6 +143,25 @@ moving latest from `main` and reports `pgmaps-scene <threejs-worldgen version>-d
 uncommitted changes). Never put a scene package in `example/public/`: it is untracked and the release build leaves
 `public/` out.
 
+The PGMaps adapter accepts legacy seven-field stems and additive stand fields (`crownBase`, `dbhCm`, `expansion`,
+`form`, `source`, with optional aligned `ids`), nine species, prescribed treated stems and `terrain.stand` palettes.
+Known palettes supply local far-forest heights and mixtures while the existing canopy/cover grids determine closure.
+Measured crown widths are preserved for additive packages. Near-tree crown bases and DBH use bounded morphology
+classes; DBH is a visual approximation after crown scaling. Expansion is metadata, never extra visual stems.
+
+Live controls arrive as `{ type: 'pgmaps-render-options', options: { ... } }`. The adapter defaults are
+`resolutionScale: 1`, `maxFps: 0` (unlimited), `maxInFlight: 2`, `dissolveMode: 'pixels'`, `dissolvePixels: 4`,
+`dissolveReferenceHeight: 1080`, `frustumCulling: true`. Standalone URLs support `renderScale`, `maxfps`, `gpuqueue`,
+`dissolve`, `cutoffpx`, `referenceheight`, `culling`. Relative dissolve uses the reference height to keep distance
+stable across resolutions; both modes are bounded by sampled patch reach, eye offset and an edge guard. These
+controls affect only this adapter. Stats distinguish submitted FPS from completed FPS and report queue failures,
+completion latency and renderer allocation/draw counters. WebGPU uses queue completion; WebGL2 uses asynchronous
+fences.
+
+Capture requests can freeze `renderOptions`; replies retain the applied snapshot. Captures always use requested
+image dimensions and bypass live scaling/frame pacing. Camera, reflection quality and live options are restored on
+failure as well as success. Incoming live camera/size/options changes wait until the capture releases the renderer.
+
 ## License
 
 Apache-2.0

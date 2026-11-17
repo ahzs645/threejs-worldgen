@@ -48,6 +48,9 @@ test('a plain package is left exactly as it is', () => {
   assert.equal(unpackArrays(null), 0)
 })
 
-test('the hello names both things PGMaps may then send', () => {
-  assert.deepEqual([...ACCEPTS], ['packed-arrays', 'scene-keys'])
+test('the hello advertises additive components, stand fields and adapter render options', () => {
+  assert.deepEqual(
+    [...ACCEPTS],
+    ['packed-arrays', 'scene-keys', 'stand-components-v1', 'stand-fields-v1', 'render-options-v1']
+  )
 })

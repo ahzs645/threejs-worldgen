@@ -1,3 +1,5 @@
+import { standSampler, type StandGrid } from './pgmaps-stand-fields'
+import { DEFAULT_RENDER_OPTIONS, boundedDissolve, type RenderOptions } from './pgmaps-render-options'
 // The PGMaps far forest: what stands past the scatter's own stems (the road view's 600 m stand).
 //
 //   single trees     real-density cards from the scatter's stems out to 2.5 km (CARD_BAND), on the package's closure,
@@ -56,7 +58,6 @@ import {
 } from 'three/tsl'
 import {
   bakePatch,
-  canopyCutoffMeters,
   cappedWidthScale,
   CARD_ASPECT,
   coverageMips,
@@ -73,6 +74,7 @@ import {
   rng,
   SILHOUETTE_CROWN_RATIO,
   SNAG_SLOT,
+  CROWN_BASE,
   syntheticStand,
   SPECIES_ORDER,
   speciesSlot,
@@ -119,8 +121,6 @@ const CANOPY_RAISE = 0.78
 const CANOPY_TONE = 0.55
 /** Pixels a median tree is tall at the dissolve distance, by default (VNS's 4 px). */
 export const DEFAULT_CUTOFF_PX = 4
-/** The live dissolve distance is kept within these, metres. */
-const LIVE_CUTOFF_MIN = 1500
 
 /**
  * sRGB colours of each species' foliage (`SPECIES_ORDER`), then the snag's wood ({@link SNAG_SLOT}), for the photo
@@ -129,22 +129,45 @@ const LIVE_CUTOFF_MIN = 1500
 // Grey-greens: distant conifer foliage is darker and far less saturated than a leaf seen close (photo far forest
 // reads #4a6263 with the haze, the VIA render's #2c3728 without). Snags: charred grey-black wood; the VIA renders
 // draw a burnt stand's stems a dark purple-grey (#2f1f3a in the Gun Lake CP007 render).
-const SPECIES_PHOTO = ['#5b6356', '#525a55', '#4c5550', '#575f55', '#676e5e', '#6a7061', '#4a4846']
+const SPECIES_PHOTO = [
+  '#5b6356',
+  '#525a55',
+  '#4c5550',
+  '#575f55',
+  '#676e5e',
+  '#6a7061',
+  '#515b50',
+  '#48554e',
+  '#6c735b',
+  '#4a4846'
+]
 // The VIA renders' canopy: dark olive, about #2a3a2a overall with its shade.
-const SPECIES_VIA = ['#555f4f', '#4b5449', '#465045', '#505a4c', '#5d6652', '#606854', '#5c4268']
+const SPECIES_VIA = [
+  '#555f4f',
+  '#4b5449',
+  '#465045',
+  '#505a4c',
+  '#5d6652',
+  '#606854',
+  '#4b5749',
+  '#435047',
+  '#657052',
+  '#5c4268'
+]
 
 /** The package fields the far forest reads. */
 export interface FarForestPackage {
-  trees: { fields: string[]; species: string[]; count: number; data: number[] }
+  trees: { fields: string[]; species: string[]; count: number; data: number[]; ids?: readonly string[] }
   species: Record<string, { crownBase: number; crownRatio?: number; broadleaf: boolean } | undefined>
-  terrain: CoverGrid & CoverClassGrid
-  farTerrain?: (CoverGrid & CoverClassGrid) | null
-  skylineTerrain?: (CoverGrid & CoverClassGrid) | null
+  terrain: CoverGrid & CoverClassGrid & StandGrid
+  farTerrain?: (CoverGrid & CoverClassGrid & StandGrid) | null
+  skylineTerrain?: (CoverGrid & CoverClassGrid & StandGrid) | null
   treeRadiusMeters?: number
 }
 
 /** A real-density stand for a `final` capture (the request's `stand`). */
 export interface FinalStand {
+  ids?: readonly string[]
   fields: readonly string[]
   species: readonly string[]
   count: number
@@ -167,6 +190,9 @@ export interface FarForest {
   canopy: THREE.Mesh | null
   /** Slabs drawn (stand patches), single-tree cards from the package, and the stand's median height. */
   stats: {
+    patchRadiusMeters: number
+    dissolveGuardMeters: number
+    paletteRecords: number
     patches: number
     cards: number
     medianHeight: number
@@ -189,14 +215,20 @@ export interface FarForest {
   /** Whether a capture holds the dissolve distance. */
   readonly pinned: boolean
   /** The dissolve distance for a frame `heightPx` pixels tall with this vertical field (`px`: VNS's threshold). */
-  cutoffFor(heightPx: number, verticalFovDegrees: number, px?: number, height?: number): number
+  cutoffFor(heightPx: number, verticalFovDegrees: number, px?: number, height?: number, eye?: readonly number[]): number
+  configure(options: Readonly<RenderOptions>): void
   /** Once a frame: the sun, for the canopy's shaded side. */
   update(sun: THREE.Vector3): void
   /**
    * Draws a `final` stand: its stems past `inner` metres from `eye` (package metres) as cards, and hides the slabs and
    * package cards inside its reach. Returns the stems placed and their median height. `groundAt` seats them.
    */
-  showFinal(stand: FinalStand, eye: readonly number[], inner: number, groundAt: (x: number, y: number) => number): { stems: number; medianHeight: number }
+  showFinal(
+    stand: FinalStand,
+    eye: readonly number[],
+    inner: number,
+    groundAt: (x: number, y: number) => number
+  ): { stems: number; medianHeight: number }
   clearFinal(): void
   dispose(): void
 }
@@ -224,8 +256,18 @@ function spritesFor(): SpriteRaster[][] {
 }
 
 function atlasTexture(levels: Array<{ data: Uint8Array; width: number; height: number }>): THREE.DataTexture {
-  const t = new THREE.DataTexture(levels[0].data, levels[0].width, levels[0].height, THREE.RGBAFormat, THREE.UnsignedByteType)
-  t.mipmaps = levels.map((l) => ({ data: l.data, width: l.width, height: l.height })) as unknown as THREE.DataTexture['mipmaps']
+  const t = new THREE.DataTexture(
+    levels[0].data,
+    levels[0].width,
+    levels[0].height,
+    THREE.RGBAFormat,
+    THREE.UnsignedByteType
+  )
+  t.mipmaps = levels.map((l) => ({
+    data: l.data,
+    width: l.width,
+    height: l.height
+  })) as unknown as THREE.DataTexture['mipmaps']
   t.generateMipmaps = false
   t.minFilter = THREE.LinearMipmapLinearFilter
   t.magFilter = THREE.LinearFilter
@@ -241,7 +283,11 @@ function cardAtlas(): Atlas {
   const cells = SPRITE_KINDS.length * TREE_VARIANTS
   const rows = Math.ceil(cells / columns)
   const [cw, ch] = TREE_CELL
-  const atlas: SpriteRaster = { data: new Uint8Array(columns * cw * rows * ch * 4), width: columns * cw, height: rows * ch }
+  const atlas: SpriteRaster = {
+    data: new Uint8Array(columns * cw * rows * ch * 4),
+    width: columns * cw,
+    height: rows * ch
+  }
   SPRITE_KINDS.forEach((name, s) => {
     for (let v = 0; v < TREE_VARIANTS; v++) {
       const k = s * TREE_VARIANTS + v
@@ -349,7 +395,12 @@ function spriteNodes(u: Looks, sample: N, right: N, toward: N, colour: N): { nor
   const nx = sample.g.mul(2).sub(1)
   const ny = sample.b.mul(2).sub(1)
   const nz = sqrt(max(float(1).sub(nx.mul(nx)).sub(ny.mul(ny)), 0.04))
-  const n: N = normalize(right.mul(nx).add(vec3(0, 1, 0).mul(ny)).add(toward.mul(nz)))
+  const n: N = normalize(
+    right
+      .mul(nx)
+      .add(vec3(0, 1, 0).mul(ny))
+      .add(toward.mul(nz))
+  )
   // A crown's sun side and shade side, across the card: the skylight lights both nearly alike, so the side away from
   // the sun is darkened here as its own crown shades it. With the sun behind the eye or ahead of it, both sides take
   // the mean.
@@ -392,14 +443,21 @@ function slabMaterial(u: Looks, atlas: Atlas): THREE.MeshStandardNodeMaterial {
   const grad = aInfo.xy
   // The angle between the eye's ray and the patch's ground: the eye's elevation plus the slope rising away from it.
   const rise = dot(grad, toward2).negate()
-  const angle = clamp(atan(toEye.y.div(dist)).add(atan(rise)), 0, (PATCH_ELEVATIONS[PATCH_ELEVATIONS.length - 1] * Math.PI) / 180)
+  const angle = clamp(
+    atan(toEye.y.div(dist)).add(atan(rise)),
+    0,
+    (PATCH_ELEVATIONS[PATCH_ELEVATIONS.length - 1] * Math.PI) / 180
+  )
   const degrees = angle.mul(180 / Math.PI)
   // The nearest baked elevation.
   let column: N = float(0)
   for (let i = 0; i < PATCH_ELEVATIONS.length - 1; i++)
     column = column.add(step((PATCH_ELEVATIONS[i] + PATCH_ELEVATIONS[i + 1]) / 2, degrees))
   // The baked angle's rise over the patch's depth (`patchRise`): the trees stand their full height on it.
-  const rises = uniformArray(PATCH_ELEVATIONS.map((e) => patchRise(2 * PATCH_RADIUS, e)), 'float')
+  const rises = uniformArray(
+    PATCH_ELEVATIONS.map((e) => patchRise(2 * PATCH_RADIUS, e)),
+    'float'
+  )
   const span = (rises.element(column.toInt()) as N).add(aPos.w)
   // Drawn at the patch's front edge, so none of its own ground stands in front of it.
   const base = vec3(
@@ -440,6 +498,7 @@ function slabMaterial(u: Looks, atlas: Atlas): THREE.MeshStandardNodeMaterial {
 function cardMaterial(u: Looks, atlas: Atlas, final: boolean): THREE.MeshStandardNodeMaterial {
   const aPos = attribute('scatterPosition', 'vec4')
   const aPar = attribute('scatterParams', 'vec4')
+  const aShape = attribute('scatterShape', 'vec4')
   const base = aPos.xyz
   const toEye = cameraPosition.sub(base)
   const flat = vec2(toEye.x, toEye.z)
@@ -447,8 +506,8 @@ function cardMaterial(u: Looks, atlas: Atlas, final: boolean): THREE.MeshStandar
   const toward2 = flat.div(dist)
   const toward = vec3(toward2.x, 0, toward2.y)
   const right = vec3(toward2.y, 0, toward2.x.negate())
-  const species = floor(aPar.w.div(4))
-  const widthScale = aPar.w.sub(species.mul(4))
+  const species = aPar.w
+  const widthScale = aShape.x
   const height = aPos.w
   const cut = u.cutoff.mul(aPar.z.mul(0.1).add(0.9))
   const hidden = final ? dist.greaterThan(cut) : dist.greaterThan(cut).or(inFinal(u, base.x, base.z))
@@ -463,7 +522,17 @@ function cardMaterial(u: Looks, atlas: Atlas, final: boolean): THREE.MeshStandar
   const k = species.mul(TREE_VARIANTS).add(variant)
   const column = mod(k, atlas.columns)
   const row = floor(k.div(atlas.columns))
-  const atlasUv = vec2(column.add(uv().x).div(atlas.columns), row.add(float(1).sub(uv().y)).div(atlas.rows))
+  const sourceV = select(
+    uv().y.lessThan(aShape.y),
+    uv().y.mul(aShape.z).div(max(aShape.y, 0.001)),
+    aShape.z.add(
+      uv()
+        .y.sub(aShape.y)
+        .mul(float(1).sub(aShape.z))
+        .div(max(float(1).sub(aShape.y), 0.001))
+    )
+  )
+  const atlasUv = vec2(column.add(uv().x).div(atlas.columns), row.add(float(1).sub(sourceV)).div(atlas.rows))
   const sample = texture(atlas.texture, atlasUv)
   const shaded = spriteNodes(u, sample, right, toward, speciesColour(u, species.toInt()).mul(aPar.y))
   material.normalNode = shaded.normal
@@ -476,9 +545,17 @@ function cardMaterial(u: Looks, atlas: Atlas, final: boolean): THREE.MeshStandar
 }
 
 /** A card mesh from a list of stems: x, y (package), ground, height, crown, species slot, tone. */
-function cardMesh(stems: Float32Array, count: number, material: THREE.Material, name: string): THREE.Group {
+function cardMesh(
+  stems: Float32Array,
+  count: number,
+  material: THREE.Material,
+  name: string,
+  preserveWidths = false,
+  crownBases?: Float32Array
+): THREE.Group {
   const position = new Float32Array(count * 4)
   const params = new Float32Array(count * 4)
+  const shapes = new Float32Array(count * 4)
   for (let n = 0; n < count; n++) {
     const o = n * 7
     const x = stems[o]
@@ -490,7 +567,8 @@ function cardMesh(stems: Float32Array, count: number, material: THREE.Material, 
     const tone = stems[o + 6]
     const species = SPRITE_KINDS[slot] ?? 'spruce'
     const ratio = height > 0 ? crown / height : SILHOUETTE_CROWN_RATIO[species]
-    const width = cappedWidthScale(ratio / SILHOUETTE_CROWN_RATIO[species], 1)
+    const measuredWidth = ratio / SILHOUETTE_CROWN_RATIO[species]
+    const width = preserveWidths ? measuredWidth : cappedWidthScale(measuredWidth, 1)
     const random = fract01(x * 12.9898 + y * 78.233)
     const p = n * 4
     position[p] = x
@@ -500,9 +578,20 @@ function cardMesh(stems: Float32Array, count: number, material: THREE.Material, 
     params[p] = random * Math.PI * 2
     params[p + 1] = 0.88 + 0.24 * (Number.isFinite(tone) ? tone : random)
     params[p + 2] = random
-    params[p + 3] = slot * 4 + width
+    params[p + 3] = slot
+    const sourceBase = species === 'snag' ? 0.32 : CROWN_BASE[species]
+    const providedBase = crownBases?.[n]
+    shapes.set(
+      [
+        width,
+        providedBase !== undefined && providedBase >= 0 ? Math.min(0.95, providedBase) : sourceBase,
+        sourceBase,
+        0
+      ],
+      p
+    )
   }
-  return tiled({ scatterPosition: position, scatterParams: params }, count, material, name)
+  return tiled({ scatterPosition: position, scatterParams: params, scatterShape: shapes }, count, material, name)
 }
 
 /** Side of the square tiles instances are grouped into, metres: each tile is one draw, culled to the view on its own. */
@@ -513,7 +602,12 @@ const TILE = 1000
  * mesh per tile with a bounding sphere that holds it, so the live view (about a sixth of the circle) and the lake's
  * mirrored view draw only the tiles they see. Every attribute is 4 floats an instance; the material is shared.
  */
-function tiled(attributes: Record<string, Float32Array>, count: number, material: THREE.Material, name: string): THREE.Group {
+function tiled(
+  attributes: Record<string, Float32Array>,
+  count: number,
+  material: THREE.Material,
+  name: string
+): THREE.Group {
   const position = attributes.scatterPosition
   // Each instance's tile, tiles numbered in the order they are first met (so the meshes, and the instances within
   // each, keep the order of the list). A tile is keyed by a number, not by text: a final stand is 1.4 million cards.
@@ -562,9 +656,14 @@ function tiled(attributes: Record<string, Float32Array>, count: number, material
     const geometry = quad()
     let low = Infinity
     let high = -Infinity
+    let reach = 60
+    const tilePositions = filled.find((v) => v.attribute === 'scatterPosition')!.outs[t]
     for (const { attribute, outs } of filled) {
       const out = outs[t]
       geometry.setAttribute(attribute, new THREE.InstancedBufferAttribute(out, 4))
+      if (attribute === 'scatterShape')
+        for (let k = 0; k < size; k++)
+          reach = Math.max(reach, (Math.abs(out[k * 4]) * CARD_ASPECT * tilePositions[k * 4 + 3]) / 2 + 1)
       if (attribute === 'scatterPosition')
         for (let k = 0; k < size; k++) {
           low = Math.min(low, out[k * 4 + 1])
@@ -574,7 +673,7 @@ function tiled(attributes: Record<string, Float32Array>, count: number, material
     geometry.instanceCount = size
     // The tile, its quads' reach past its edge (a patch's front edge and width, a card's crown), and its heights.
     const centre = new THREE.Vector3((tx + 0.5) * TILE, (low + high) / 2 + 40, (tz + 0.5) * TILE)
-    geometry.boundingSphere = new THREE.Sphere(centre, Math.hypot(TILE * 0.71 + 60, (high - low) / 2 + 160))
+    geometry.boundingSphere = new THREE.Sphere(centre, Math.hypot(TILE * 0.71 + reach, (high - low) / 2 + 160))
     const mesh = new THREE.Mesh(geometry, material)
     mesh.name = `${name} ${key}`
     mesh.frustumCulled = true
@@ -621,13 +720,9 @@ function canopyMaterial(u: Looks): THREE.MeshStandardNodeMaterial {
   const closure = a.x
   const d = distance(positionWorld.xz, cameraPosition.xz)
   const dither = hash(screenCoordinate.x.add(screenCoordinate.y.mul(4099)))
-  const visible = closure
-    .greaterThan(MIN_CLOSURE)
-    .and(d.greaterThan(u.cutoff.mul(dither.mul(0.1).add(0.9))))
+  const visible = closure.greaterThan(MIN_CLOSURE).and(d.greaterThan(u.cutoff.mul(dither.mul(0.1).add(0.9))))
   // Colours: the stand's conifers (spruce/fir) or broadleaves, in the look in force.
-  const conifer = speciesColour(u, 1)
-  const broadleaf = speciesColour(u, 4)
-  const crown = mix(conifer, broadleaf, a.z)
+  const crown = mix(attribute('aCanopyPhoto', 'vec3'), attribute('aCanopyVia', 'vec3'), u.via)
   const gap = crown.mul(0.22)
   // Screen-aligned axes at this point: across the view (crowns sit side by side) and up (spires).
   const view = positionWorld.xz.sub(cameraPosition.xz)
@@ -667,7 +762,8 @@ function canopyGeometry(
   heightAt: (x: number, y: number) => number,
   broadleafAt: (x: number, y: number) => number,
   groundAt: (x: number, y: number) => number,
-  extent: number
+  extent: number,
+  coloursAt: (x: number, y: number) => number[]
 ): THREE.BufferGeometry {
   const rings: Array<[from: number, to: number, step: number]> = []
   const plan: Array<[number, number, number]> = [
@@ -681,6 +777,8 @@ function canopyGeometry(
   }
   const positions: number[] = []
   const canopy: number[] = []
+  const photo: number[] = []
+  const via: number[] = []
   const indices: number[] = []
   rings.forEach(([from, to, step], k) => {
     const next = rings[k + 1]
@@ -698,6 +796,9 @@ function canopyGeometry(
         const raise = closure > MIN_CLOSURE ? h * CANOPY_RAISE * Math.min(1, (closure - MIN_CLOSURE) / 0.2 + 0.35) : -3
         positions.push(x, groundAt(x, y) + raise, -y)
         canopy.push(closure, h, broadleafAt(x, y), 0)
+        const colours = coloursAt(x, y)
+        photo.push(...colours.slice(0, 3))
+        via.push(...colours.slice(3, 6))
       }
     const inner = from - step
     for (let r = 0; r < n; r++)
@@ -716,6 +817,8 @@ function canopyGeometry(
   const g = new THREE.BufferGeometry()
   g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
   g.setAttribute('aCanopy', new THREE.Float32BufferAttribute(canopy, 4))
+  g.setAttribute('aCanopyPhoto', new THREE.Float32BufferAttribute(photo, 3))
+  g.setAttribute('aCanopyVia', new THREE.Float32BufferAttribute(via, 3))
   g.setIndex(indices)
   g.computeVertexNormals()
   g.computeBoundingSphere()
@@ -728,6 +831,7 @@ const MIX_CELL = 240
 
 /** Species shares and mean height of the package's stems per 240 m cell, with the whole package's as a fallback. */
 function standMix(pkg: FarForestPackage) {
+  const paletteAt = standSampler([pkg.terrain, pkg.farTerrain, pkg.skylineTerrain])
   const fields = pkg.trees.fields
   const stride = fields.length
   const [ix, iy, is, ih] = ['x', 'y', 'species', 'height'].map((f) => fields.indexOf(f))
@@ -757,6 +861,12 @@ function standMix(pkg: FarForestPackage) {
   return {
     medianHeight,
     at(x: number, y: number): { counts: number[]; height: number } {
+      const known = paletteAt(x, y)
+      if (known) {
+        const counts = new Array(SPECIES_ORDER.length).fill(0)
+        for (const entry of known.species) if (entry.share > 0) counts[speciesSlot(entry.species)] += entry.share
+        return { counts, height: known.heightMeters }
+      }
       const c = Math.floor(x / MIX_CELL)
       const r = Math.floor(y / MIX_CELL)
       const own = cells.get(key(c, r))
@@ -793,12 +903,14 @@ export function buildFarForest(
   farStems: readonly number[]
 ): FarForest {
   const u = lookUniforms()
+  let renderOptions: Readonly<RenderOptions> = DEFAULT_RENDER_OPTIONS
   const object = new THREE.Group()
   object.name = 'far forest'
   const cover = coverSampler(pkg as Parameters<typeof coverSampler>[0])
   const extentOf = ground.skylineExtent ?? ground.farExtent ?? ground.drawnExtent
   const extent = Math.min(-extentOf.west, extentOf.east, -extentOf.south, extentOf.north)
-  const inExtent = (x: number, y: number) => x >= extentOf.west && x <= extentOf.east && y >= extentOf.south && y <= extentOf.north
+  const inExtent = (x: number, y: number) =>
+    x >= extentOf.west && x <= extentOf.east && y >= extentOf.south && y <= extentOf.north
   /** Crown closure, with a regional stand where the package says nothing and the ground is not cut or water. */
   const closureAt = (x: number, y: number) => {
     if (!inExtent(x, y) || ground.inWater(x, y)) return 0
@@ -897,7 +1009,7 @@ export function buildFarForest(
       const g = ground.groundAt(x, y)
       const gx = (ground.groundAt(x + 10, y) - ground.groundAt(x - 10, y)) / 20
       const gy = (ground.groundAt(x, y + 10) - ground.groundAt(x, y - 10)) / 20
-      pos.push(x, g, -y, Math.max(6, local.height))
+      pos.push(x, g, -y, Math.max(0.5, local.height))
       par.push(yaw, 0.86 + 0.28 * tint, keep, 0)
       info.push(gx, -gy, species * PATCH_CLOSURES.length + closureLevel, 0)
     }
@@ -914,9 +1026,20 @@ export function buildFarForest(
   const cards = cardAtlas()
   const fields = pkg.trees.fields
   const stride = fields.length
-  const [ix, iy, is, ih, iw, it] = ['x', 'y', 'species', 'height', 'crownWidth', 'tone'].map((f) => fields.indexOf(f))
+  const [ix, iy, is, ih, iw, it, ib, iff] = [
+    'x',
+    'y',
+    'species',
+    'height',
+    'crownWidth',
+    'tone',
+    'crownBase',
+    'form'
+  ].map((f) => fields.indexOf(f))
   const slotOf = pkg.trees.species.map((name) => speciesSlot(name))
   const single: number[] = []
+  const singleBases: number[] = []
+  const paletteAt = standSampler([pkg.terrain, pkg.farTerrain, pkg.skylineTerrain])
   for (const i of farStems) {
     const o = i * stride
     const x = pkg.trees.data[o + ix]
@@ -929,7 +1052,16 @@ export function buildFarForest(
       if (Math.hypot(x, y) <= slabReach) continue
       const snag = asSnag(x, y, pkg.trees.data[o + ih], iw >= 0 ? pkg.trees.data[o + iw] : 0, age)
       if (!snag) continue
-      single.push(x, y, ground.groundAt(x, y), snag.height, snag.crownWidth, SNAG_SLOT, it >= 0 ? pkg.trees.data[o + it] : 0.5)
+      single.push(
+        x,
+        y,
+        ground.groundAt(x, y),
+        snag.height,
+        snag.crownWidth,
+        SNAG_SLOT,
+        it >= 0 ? pkg.trees.data[o + it] : 0.5
+      )
+      singleBases.push(0.32)
       snags++
       continue
     }
@@ -942,6 +1074,15 @@ export function buildFarForest(
       iw >= 0 ? pkg.trees.data[o + iw] : 0,
       slotOf[pkg.trees.data[o + is]] ?? 1,
       it >= 0 ? pkg.trees.data[o + it] : 0.5
+    )
+    singleBases.push(
+      ib >= 0 && pkg.trees.data[o + ib] >= 0
+        ? pkg.trees.data[o + ib]
+        : iff >= 0 && pkg.trees.data[o + iff] > 0
+          ? pkg.trees.data[o + iff] === 2
+            ? 0.05
+            : 0.15
+          : -1
     )
   }
   // The card band: real-density single trees from the near stand out to CARD_BAND, on the closure, mix and heights.
@@ -978,11 +1119,39 @@ export function buildFarForest(
     const slots = band.species.map((name) => speciesSlot(name))
     for (let i = 0; i < band.count; i++) {
       const o = i * 7
+      const known = paletteAt(band.data[o], band.data[o + 1])
+      let localSlot = slots[band.data[o + 3]] ?? 1
+      if (known) {
+        const positive = known.species.filter((s) => s.share > 0)
+        let target =
+          fract01(band.data[o] * 8.31 + band.data[o + 1] * 19.17) * positive.reduce((sum, s) => sum + s.share, 0)
+        let selected = positive[positive.length - 1]
+        for (const species of positive) {
+          target -= species.share
+          if (target <= 0) {
+            selected = species
+            break
+          }
+        }
+        localSlot = speciesSlot(selected.species)
+        band.data[o + 4] =
+          selected.heightMeters && selected.heightMeters > 0 ? selected.heightMeters : known.heightMeters
+        band.data[o + 5] = band.data[o + 4] * SILHOUETTE_CROWN_RATIO[SPRITE_KINDS[localSlot]]
+      }
       const age = burntAge(band.data[o], band.data[o + 1])
       if (Number.isFinite(age)) {
         const snag = asSnag(band.data[o], band.data[o + 1], band.data[o + 4], band.data[o + 5], age)
         if (!snag) continue
-        single.push(band.data[o], band.data[o + 1], band.data[o + 2], snag.height, snag.crownWidth, SNAG_SLOT, band.data[o + 6])
+        single.push(
+          band.data[o],
+          band.data[o + 1],
+          band.data[o + 2],
+          snag.height,
+          snag.crownWidth,
+          SNAG_SLOT,
+          band.data[o + 6]
+        )
+        singleBases.push(0.32)
         snags++
         continue
       }
@@ -990,25 +1159,62 @@ export function buildFarForest(
         thinned++
         continue
       }
-      single.push(band.data[o], band.data[o + 1], band.data[o + 2], band.data[o + 4], band.data[o + 5], slots[band.data[o + 3]] ?? 1, band.data[o + 6])
+      single.push(
+        band.data[o],
+        band.data[o + 1],
+        band.data[o + 2],
+        band.data[o + 4],
+        band.data[o + 5],
+        localSlot,
+        band.data[o + 6]
+      )
+      singleBases.push(-1)
     }
   }
   const singleCards = single.length
-    ? cardMesh(new Float32Array(single), single.length / 7, cardMaterial(u, cards, false), 'far forest: single stems')
+    ? cardMesh(
+        new Float32Array(single),
+        single.length / 7,
+        cardMaterial(u, cards, false),
+        'far forest: single stems',
+        pkg.trees.fields.includes('crownBase'),
+        new Float32Array(singleBases)
+      )
     : null
   if (singleCards) object.add(singleCards)
 
   // The canopy surface.
-  const heightAt = (x: number, y: number) => Math.max(8, mix6.at(x, y).height)
+  const heightAt = (x: number, y: number) => Math.max(0.5, mix6.at(x, y).height)
   const broadleafAt = (x: number, y: number) => {
     const m = mix6.at(x, y).counts
     const sum = m.reduce((s, v) => s + v, 0) || 1
-    return (m[4] + m[5]) / sum
+    return (m[4] + m[5] + (m[8] ?? 0)) / sum
   }
   // Raised only where the ground is not open: rock, herb and shrub ground keeps its own height and look.
   const canopyAt = (x: number, y: number) =>
     canopyClosure(closureAt(x, y), classAt ? classAt(x, y) : null, standingAt(x, y))
-  const canopy = extent > 1000 ? new THREE.Mesh(canopyGeometry(canopyAt, heightAt, broadleafAt, ground.groundAt, extent), canopyMaterial(u)) : null
+  const photoColours = SPECIES_PHOTO.map((colour) => new THREE.Color(colour))
+  const viaColours = SPECIES_VIA.map((colour) => new THREE.Color(colour))
+  const coloursAt = (x: number, y: number) => {
+    const counts = mix6.at(x, y).counts
+    const sum = counts.reduce((a, b) => a + b, 0) || 1
+    return [photoColours, viaColours].flatMap((palette) => {
+      const out = [0, 0, 0]
+      counts.forEach((share, k) => {
+        out[0] += (palette[k].r * share) / sum
+        out[1] += (palette[k].g * share) / sum
+        out[2] += (palette[k].b * share) / sum
+      })
+      return out
+    })
+  }
+  const canopy =
+    extent > 1000
+      ? new THREE.Mesh(
+          canopyGeometry(canopyAt, heightAt, broadleafAt, ground.groundAt, extent, coloursAt),
+          canopyMaterial(u)
+        )
+      : null
   if (canopy) {
     canopy.name = 'far forest: canopy surface'
     canopy.castShadow = false
@@ -1016,7 +1222,7 @@ export function buildFarForest(
     object.add(canopy)
   }
   console.log(
-    `[far forest] ${patchCount} stand patches to ${Math.round(slabReach)} m, ${single.length / 7} single stems (${snags} snags on burnt ground, ${thinned} thinned by cover${classAt ? '' : ', no cover codes'}), canopy ${canopy ? (canopy.geometry.index!.count / 3) : 0} triangles, median height ${mix6.medianHeight.toFixed(1)} m`
+    `[far forest] ${patchCount} stand patches to ${Math.round(slabReach)} m, ${single.length / 7} single stems (${snags} snags on burnt ground, ${thinned} thinned by cover${classAt ? '' : ', no cover codes'}), canopy ${canopy ? canopy.geometry.index!.count / 3 : 0} triangles, median height ${mix6.medianHeight.toFixed(1)} m`
   )
 
   let finalMesh: THREE.Group | null = null
@@ -1044,6 +1250,12 @@ export function buildFarForest(
   object.add(finalPrimer)
   let pinned = false
   const stats = {
+    patchRadiusMeters: Math.min(SLAB_MAX, extent),
+    dissolveGuardMeters: PATCH_RADIUS + PATCH_SPACING,
+    paletteRecords: [pkg.terrain, pkg.farTerrain, pkg.skylineTerrain].reduce(
+      (sum, grid) => sum + (grid?.stand?.records.length ?? 0),
+      0
+    ),
     patches: patchCount,
     cards: single.length / 7,
     medianHeight: mix6.medianHeight,
@@ -1075,8 +1287,24 @@ export function buildFarForest(
     get pinned() {
       return pinned
     },
-    cutoffFor(heightPx, vfov, px = DEFAULT_CUTOFF_PX, height = mix6.medianHeight) {
-      return Math.max(LIVE_CUTOFF_MIN, canopyCutoffMeters(height, heightPx, vfov, px))
+    cutoffFor(heightPx, vfov, px = renderOptions.dissolvePixels, height = mix6.medianHeight, eye = [0, 0]) {
+      return boundedDissolve(
+        height,
+        heightPx,
+        vfov,
+        renderOptions,
+        Math.min(SLAB_MAX, extent),
+        Math.hypot(eye[0], eye[1]),
+        PATCH_RADIUS + PATCH_SPACING,
+        px
+      )
+    },
+    configure(options) {
+      renderOptions = options
+      object.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh && child !== canopy && child.parent !== finalPrimer)
+          child.frustumCulled = options.frustumCulling
+      })
     },
     update(sun) {
       u.sun.value.copy(sun)
@@ -1086,9 +1314,19 @@ export function buildFarForest(
       if (!finalKept || finalKept.key !== key || finalKept.groundAt !== groundAt) {
         const fieldsOf = [...stand.fields]
         const sStride = fieldsOf.length
-        const [sx, sy, ss, sh, sw, st] = ['x', 'y', 'species', 'height', 'crownWidth', 'tone'].map((f) => fieldsOf.indexOf(f))
+        const [sx, sy, ss, sh, sw, st, sb, sf] = [
+          'x',
+          'y',
+          'species',
+          'height',
+          'crownWidth',
+          'tone',
+          'crownBase',
+          'form'
+        ].map((f) => fieldsOf.indexOf(f))
         const slots = stand.species.map((name) => speciesSlot(name))
         const list = new Float32Array(stand.count * 7)
+        const crownBases = new Float32Array(stand.count).fill(-1)
         const heights: number[] = []
         let count = 0
         let dropped = 0
@@ -1130,6 +1368,16 @@ export function buildFarForest(
           list[k + 4] = crown
           list[k + 5] = slot
           list[k + 6] = st >= 0 ? stand.data[o + st] : 0.5
+          crownBases[count] =
+            slot === SNAG_SLOT
+              ? 0.32
+              : sb >= 0 && stand.data[o + sb] >= 0
+                ? stand.data[o + sb]
+                : sf >= 0 && stand.data[o + sf] > 0
+                  ? stand.data[o + sf] === 2
+                    ? 0.05
+                    : 0.15
+                  : -1
           if (count % 5 === 0) heights.push(h)
           count++
         }
@@ -1139,7 +1387,7 @@ export function buildFarForest(
         finalKept = {
           key,
           groundAt,
-          mesh: count ? cardMesh(list, count, finalMaterial, 'far forest: final stand') : null,
+          mesh: count ? cardMesh(list, count, finalMaterial, 'far forest: final stand', sb >= 0, crownBases) : null,
           stems: count,
           medianHeight: Number.isFinite(middle) ? middle : mix6.medianHeight,
           dropped
@@ -1150,6 +1398,9 @@ export function buildFarForest(
       if (mesh) {
         finalMesh = mesh
         object.add(mesh)
+        mesh.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) child.frustumCulled = renderOptions.frustumCulling
+        })
       }
       u.finalOn.value = 1
       u.finalEye.value.set(eye[0], -eye[1])

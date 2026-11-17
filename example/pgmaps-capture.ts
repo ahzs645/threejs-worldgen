@@ -1,3 +1,4 @@
+import type { RenderOptions } from './pgmaps-render-options'
 // `pgmaps-capture`: PGMaps asks for the frames its analysis sheet is framed on (PGMaps
 // src/pages/dev-forestry/engineCapture.ts). For each frame, from one scene and one camera:
 //   image   the scene as drawn now (environment, weather, post), rendered offscreen at the frame's size, PNG;
@@ -58,7 +59,14 @@ import {
 } from './pgmaps-capture-math'
 import { inRing } from './pgmaps-ground'
 import { TREE_LOD_METRES } from './pgmaps-trees'
-import { CARD_BAND, CARD_BAND_DENSITY, DEFAULT_CUTOFF_PX, SLAB_MAX, type FarForest, type FinalStand } from './pgmaps-far-forest'
+import {
+  CARD_BAND,
+  CARD_BAND_DENSITY,
+  DEFAULT_CUTOFF_PX,
+  SLAB_MAX,
+  type FarForest,
+  type FinalStand
+} from './pgmaps-far-forest'
 import {
   jitterOffsets,
   linearToSrgbByte,
@@ -68,7 +76,6 @@ import {
   SRGB_TO_LINEAR
 } from './pgmaps-far-forest-math'
 
-
 declare const __WORLDGEN_VERSION__: string | undefined
 
 export const CAPTURE_ENGINE = 'threejs-worldgen'
@@ -76,6 +83,8 @@ export const CAPTURE_VERSION = typeof __WORLDGEN_VERSION__ === 'string' ? __WORL
 
 export interface CaptureRequest {
   type: 'pgmaps-capture'
+  /** Frozen adapter options for this capture; live scale and frame pacing never size or throttle it. */
+  renderOptions?: Partial<RenderOptions>
   id: string
   position: [number, number, number]
   frames: CaptureFrame[]
@@ -127,6 +136,16 @@ export interface CaptureReply {
   scene: { createdAt: string | null; origin: { lng: number; lat: number; elevationMeters?: number } | null }
   environment: Record<string, unknown> | null
   maxTreeHeightMeters: number | null
+  renderOptions: RenderOptions
+  dissolve: {
+    requestedPixels: number
+    mode: RenderOptions['dissolveMode']
+    referenceHeight: number
+    cutoffMeters: number
+    patchRadiusMeters: number
+    eyeOffsetMeters: number
+    guardMeters: number
+  }
   /** What was drawn without data, as short phrases the sheet prints (at most about 60 characters each). */
   missing: string[]
   /** The same and every other limit of the capture, at length with figures. */
@@ -142,6 +161,7 @@ export interface CapturePackage {
   camera: { position: [number, number, number]; bearingDegrees: number; pitchDegrees: number }
   trees: { fields: string[]; count: number; data: number[] }
   treeRadiusMeters: number
+  treated?: { count: number }
 }
 
 /** What the page lends the capture. */
@@ -169,6 +189,8 @@ export interface CaptureHost {
    * What the frame loop does before drawing (sky, light, shadows, stand, water), at the camera as it stands; `fit`
    * centres and sizes the sun's shadow box on a frame's near frustum.
    */
+  renderOptions(): RenderOptions
+  captureOptions(options?: Partial<RenderOptions>): Promise<() => void>
   prepare(now: number, fit?: { centre: THREE.Vector3; radius: number }): void
 }
 
@@ -370,15 +392,15 @@ export function createCapturer(host: CaptureHost) {
         select(
           classRole.equal(5),
           canopyClass,
-        select(
-          classRole.equal(1).and(nearDrape.inside),
-          nearDrape.texel.rgb,
           select(
-            classRole.equal(2).and(farDrape.inside),
-            farDrape.texel.rgb,
-            select(classRole.equal(4).and(skylineDrape.inside), skylineDrape.texel.rgb, classColour)
+            classRole.equal(1).and(nearDrape.inside),
+            nearDrape.texel.rgb,
+            select(
+              classRole.equal(2).and(farDrape.inside),
+              farDrape.texel.rgb,
+              select(classRole.equal(4).and(skylineDrape.inside), skylineDrape.texel.rgb, classColour)
+            )
           )
-        )
         )
       ),
       positionView.z.negate()
@@ -491,6 +513,26 @@ export function createCapturer(host: CaptureHost) {
     check(request)
     const built = await host.settled()
     if (!built) throw new Error('No scene is loaded to capture.')
+    const restoreOptions = await host.captureOptions(request.renderOptions)
+    const mirror = built.ground.water?.mirror
+    const mirrorScale = mirror?.reflector.resolutionScale
+    try {
+      return await captureBuilt(request, built, onProgress)
+    } finally {
+      built.farForest.clearFinal()
+      built.farForest.pin(null)
+      if (mirror && mirrorScale !== undefined) mirror.reflector.resolutionScale = mirrorScale
+      freeTextures()
+      restoreOptions()
+    }
+  }
+
+  async function captureBuilt(
+    request: CaptureRequest,
+    built: NonNullable<Awaited<ReturnType<CaptureHost['settled']>>>,
+    onProgress?: CaptureProgress
+  ): Promise<CaptureReply> {
+    const appliedOptions = host.renderOptions()
     const { pkg, scatter, ground, farForest } = built
     const started = performance.now()
     /** Milliseconds spent in each stage of the capture, over all its frames (`lastSummary.timings`). */
@@ -503,7 +545,10 @@ export function createCapturer(host: CaptureHost) {
     }
     const final = request.quality === 'final'
     const samples = final
-      ? Math.min(MAX_SAMPLES, Math.max(1, Math.round(Number.isFinite(request.samples) ? request.samples! : FINAL_SAMPLES)))
+      ? Math.min(
+          MAX_SAMPLES,
+          Math.max(1, Math.round(Number.isFinite(request.samples) ? request.samples! : FINAL_SAMPLES))
+        )
       : 1
     // The final stand, before the stems are coded: its cards are coded with them.
     const nearRadius = built.maxDistance - 50
@@ -538,9 +583,14 @@ export function createCapturer(host: CaptureHost) {
     }
     const deadline = started + CAPTURE_BUDGET_MS
     // The dissolve distance for these frames: where the stand's median tree is under `canopyCutoffPx` pixels tall.
-    const cutoffPx = Number.isFinite(request.canopyCutoffPx) && request.canopyCutoffPx! > 0 ? request.canopyCutoffPx! : DEFAULT_CUTOFF_PX
+    const cutoffPx =
+      Number.isFinite(request.canopyCutoffPx) && request.canopyCutoffPx! > 0
+        ? request.canopyCutoffPx!
+        : appliedOptions.dissolvePixels
     const cutoff = Math.max(
-      ...request.frames.map((f) => farForest.cutoffFor(f.height, f.verticalFovDegrees, cutoffPx, standHeight))
+      ...request.frames.map((f) =>
+        farForest.cutoffFor(f.height, f.verticalFovDegrees, cutoffPx, standHeight, request.position)
+      )
     )
     farForest.pin(cutoff)
     const mirror = ground.water?.mirror ?? null
@@ -715,23 +765,37 @@ export function createCapturer(host: CaptureHost) {
         `Past them the forest is drawn from the package's crown closure, species mix and stem heights: single trees at real density ` +
         `(about ${CARD_BAND_DENSITY} stems/ha × closure, real crowns) to ${CARD_BAND / 1000} km, then ${forest.patches} stand patches ` +
         `(a ${2 * PATCH_RADIUS} m disc of real-density trees baked from 7 angles to its ground, one per ${PATCH_SPACING} m cell of forest) out to ` +
-        `${Math.round(cutoff)} m, where the median tree (${standHeight.toFixed(1)} m) is ${cutoffPx} px tall in the frame, and the canopy ` +
+        `${Math.round(cutoff)} m, using ${appliedOptions.dissolveMode} dissolve at requested ${cutoffPx} px ` +
+        `(reference height ${appliedOptions.dissolveReferenceHeight} px; median tree ${standHeight.toFixed(1)} m), bounded by sampled patch reach ` +
+        `minus eye offset and the patch edge guard; the canopy ` +
         `surface past it (the ground raised by the stand's height, coloured by its species and closure). ` +
         `The package's ${forest.packageStems} far stems stand for that forest (those on open ground are drawn as single trees); ${forest.cards} single trees in all. ` +
         (forest.coverCodes
           ? `The package's ground cover codes thin the far forest: no trees on rock or water, fewer on sparse forest, shrub and herb ground ` +
             `(${forest.thinned} single trees left out), and the canopy surface is not raised over rock, herb or shrub; the ground there is drawn as that cover. `
           : 'The package carries no ground cover codes. ') +
-        'Every drawn tree is at most 1.5 times wider than its grown shape. Impostors, patches and cards keep their silhouettes in the class pass; ' +
+        (pkg.trees.fields.includes('crownBase') || (final && request.stand?.fields.includes('crownBase'))
+          ? 'Additive stands retain supplied crown widths. Near meshes use crown-base classes of 0.2 and six trunk slenderness classes where DBH is supplied; their trunk diameter is approximate after crown scaling. Far cards remap their crown base/form and retain their silhouette in the class pass. Expansion and source IDs are metadata; every supplied visual record is drawn at most once. '
+          : 'Legacy trees are at most 1.5 times wider than their grown shape. Impostors, patches and cards keep their silhouettes in the class pass. ') +
         "their depth is the card's plane; the canopy surface takes the class of the ground under it."
     )
+    if (forest.paletteRecords)
+      detail.push(
+        `${forest.paletteRecords} local stand palette records supply far-forest heights and species mixtures; canopy and cover grids still determine closure.`
+      )
+    if (pkg.treated?.count)
+      detail.push(
+        `${pkg.treated.count} prescribed treated records are drawn with instanced stumps, logs, snags and felled stems; felled crowns are approximate retained crowns. Other clearcuts retain their seeded stumps.`
+      )
     if (final)
       detail.push(
         request.stand
           ? `Final render: the frame's real-density stand (${request.stand.count} stems to ${Math.round(request.stand.radiusMeters)} m, ` +
               `bearings ${request.stand.bearings.map((b) => Math.round(b)).join('–')}°) replaces the stand patches there; ${finalStems} of its stems past ` +
               `${Math.round(nearRadius)} m are drawn as cards (those nearer are the package's own, as meshes), dissolving into the canopy past ${Math.round(cutoff)} m` +
-              (forest.coverCodes ? `; ${forest.finalThinned} stood on rock, water or open ground and were left out by its cover codes.` : '.')
+              (forest.coverCodes
+                ? `; ${forest.finalThinned} stood on rock, water or open ground and were left out by its cover codes.`
+                : '.')
           : 'Final render with no stand sent: the stand patches are drawn.'
       )
     if (wet) detail.push(`${wet} stems standing in water are not drawn.`)
@@ -1104,14 +1168,33 @@ export function createCapturer(host: CaptureHost) {
       detail.push(
         `Final render: ${samplesDrawn} of the ${samples} samples asked were accumulated per frame before the capture's ${CAPTURE_BUDGET_MS / 1000} s budget ran out.`
       )
-    if (standFailed) detail.push(`Final render: the stand sent could not be drawn (${standFailed}); the stand patches were drawn instead.`)
+    if (standFailed)
+      detail.push(
+        `Final render: the stand sent could not be drawn (${standFailed}); the stand patches were drawn instead.`
+      )
+    const dissolve = {
+      requestedPixels: cutoffPx,
+      mode: appliedOptions.dissolveMode,
+      referenceHeight: appliedOptions.dissolveReferenceHeight,
+      cutoffMeters: Math.round(cutoff),
+      patchRadiusMeters: farForest.stats.patchRadiusMeters,
+      eyeOffsetMeters: Math.round(Math.hypot(request.position[0], request.position[1])),
+      guardMeters: farForest.stats.dissolveGuardMeters
+    }
     const finalRecord = final
-      ? { samples: samplesDrawn, stems: finalStems, canopyCutoffMeters: Number.isFinite(cutoff) ? Math.round(cutoff) : null, millis: Math.round(lastTimingMs) }
+      ? {
+          samples: samplesDrawn,
+          stems: finalStems,
+          canopyCutoffMeters: Number.isFinite(cutoff) ? Math.round(cutoff) : null,
+          millis: Math.round(lastTimingMs)
+        }
       : null
     lastSummary = {
       ms: Math.round(lastTimingMs),
       timings: Object.fromEntries(Object.entries(spent).map(([stage, ms]) => [stage, Math.round(ms)])),
       final: finalRecord,
+      renderOptions: { ...appliedOptions },
+      dissolve,
       canopyCutoffMeters: Math.round(cutoff),
       stems: drawnStems,
       farForest: { ...farForest.stats },
@@ -1134,6 +1217,8 @@ export function createCapturer(host: CaptureHost) {
         ...structuredClone(atmosphere.applied),
         sun: { ...atmosphere.sunRecord }
       } as Record<string, unknown>,
+      renderOptions: { ...appliedOptions },
+      dissolve,
       maxTreeHeightMeters: Number.isFinite(tallest) ? Math.round(tallest * 10) / 10 : null,
       missing,
       missingDetail: detail,

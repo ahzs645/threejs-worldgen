@@ -1,3 +1,4 @@
+import type { StandGrid } from './pgmaps-stand-fields'
 // A PGMaps package's ground: the terrain with forest floor, harvested ground (soil, duff, dry grass) inside openings
 // and exposed mineral soil on road scars, weathered (wet, snow) through threejs-weathering; stumps and slash on the cut
 // ground; and the package's water bodies as threejs-water lakes, with their beds carved into the terrain.
@@ -72,7 +73,7 @@ export interface WaterBody {
 }
 
 /** A package terrain grid: row-major from the south row, west to east; null where the source has no height. */
-export interface TerrainGrid {
+export interface TerrainGrid extends StandGrid {
   west: number
   south: number
   spacing: number
@@ -386,7 +387,10 @@ export async function buildGround(
           for (let i = 0; i < sky.columns; i++) {
             const k = j * sky.columns + i
             if (sky.cover[k] !== SCENE_COVER.water) continue
-            const level = droppedSeaLevel(Math.hypot(sky.west + i * sky.spacing, sky.south + j * sky.spacing), curvature)
+            const level = droppedSeaLevel(
+              Math.hypot(sky.west + i * sky.spacing, sky.south + j * sky.spacing),
+              curvature
+            )
             skylineHeights[k] = skylineWaterHeight(skylineHeights[k], level)
           }
       skylineInvented = fillGaps(skylineHeights, sky.columns, sky.rows) / skylineHeights.length
@@ -803,7 +807,9 @@ function groundMaterial(states: MaterialStateUniforms, treeRadius: number, via: 
   const photoCut = mix(bare, green, greened).mul(n3.mul(0.2).add(1)).mul(shadeRetained)
   // The VIA look paints fresh cut ground (the first year: a proposed block after harvest) as the renders do: pinkish
   // tan with a fine slash speckle (pgmaps-cover.ts `VIA_CUT_SRGB`); older openings green up as above.
-  const viaFresh = float(1).sub(smoothstep(VIA_FRESH_CUT_YEARS, VIA_FRESH_CUT_YEARS + 1, age)).mul(via)
+  const viaFresh = float(1)
+    .sub(smoothstep(VIA_FRESH_CUT_YEARS, VIA_FRESH_CUT_YEARS + 1, age))
+    .mul(via)
   const cut = mix(photoCut, viaCutPaint(n5).mul(shadeRetained), viaFresh)
 
   // Road scars: pale gravelly cut banks, darker loose fill.
@@ -846,7 +852,11 @@ function viaCutPaint(n5: Node): Node {
   const tan = vec3(r, g, b).mul(n5.mul(0.08).add(blotch.mul(0.1)).add(1))
   const light = vec3(r * 1.35, g * 1.32, b * 1.3)
   const dark = vec3(r * 0.45, g * 0.4, b * 0.38)
-  return mix(mix(tan, light, smoothstep(0.84, 0.92, grain).mul(0.8)), dark, smoothstep(0.68, 0.84, grain.oneMinus()).mul(0.7))
+  return mix(
+    mix(tan, light, smoothstep(0.84, 0.92, grain).mul(0.8)),
+    dark,
+    smoothstep(0.68, 0.84, grain.oneMinus()).mul(0.7)
+  )
 }
 
 /**

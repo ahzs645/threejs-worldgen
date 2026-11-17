@@ -4,17 +4,14 @@
 // full, simplified and coarse meshes out to a few hundred metres and as baked impostors beyond.
 import * as THREE from 'three/webgpu'
 import { disposeLayers, FIXED_INSTANCE_STRIDE, hash, hashString, type ScatterLayer } from 'threejs-scatter'
-import {
-  createVegetationLayers,
-  generateTreeLevels,
-  mergeTreeGeometry,
-  species as presets,
-  type TreeParams
-} from 'threejs-trees'
+import { createVegetationLayers, generateTreeLevels, mergeTreeGeometry } from 'threejs-trees'
 import { binCrownWidth, binSeed, heightBin, TREE_HEIGHT_LADDER } from './pgmaps-tree-bins'
 import { cappedWidthScale } from './pgmaps-far-forest-math'
 import { snagForm, standingSnagShare } from './pgmaps-burn'
 import { keepStem, stemHash } from './pgmaps-nature'
+import { recipe } from './pgmaps-tree-recipes'
+import { morphology, stemMetadata, type StandTable } from './pgmaps-stand-fields'
+import { farStandTiles, setFarCulling } from './pgmaps-far-cards'
 
 /**
  * The grown kind every stem on burnt ground is drawn as (cover 7, pgmaps-burn.ts): a fire-killed snag, bare grey-black
@@ -28,7 +25,7 @@ const SNAG_CROWN_BASE = 0.32
 
 /** The stems of a package (`trees` block) and its species table. */
 export interface StandInput {
-  trees: { fields: string[]; species: string[]; count: number; data: number[] }
+  trees: StandTable & { fields: string[]; species: string[]; data: number[] }
   species: Record<string, { crownBase: number; crownRatio?: number; broadleaf: boolean } | undefined>
 }
 
@@ -40,127 +37,6 @@ export interface StandInput {
 export const TREE_LOD_METRES = { full: 55, simplified: 120, coarse: 190 }
 /** Detail of the simplified and coarse meshes (see `generateTreeLevels`). */
 const DETAIL = { simplified: 0.35, coarse: 0.16 }
-
-/**
- * Generator settings for PGMaps' species, at a variant's height `h`, crown width `w` and crown base (fraction of the
- * height that is clear stem). Conifers grow a straight leader with needle sprays along drooping or level branches;
- * aspen and birch are broadleaves with pale bark.
- */
-function recipe(name: string, h: number, w: number, crownBase: number): TreeParams {
-  const r = Math.max(0.6, w / 2)
-  const crownHeight = h * (1 - crownBase)
-  // Growth steps of about a fiftieth of the height: tall stems get fewer, longer segments (half the tube rings of
-  // the presets' 0.33 m), with leaf cards scaled up to keep the crowns as full.
-  const step = Math.min(0.55, Math.max(0.32, h / 55))
-  const sized = (base: TreeParams, extra: Partial<TreeParams>, shape: TreeParams['crownShape']): TreeParams => {
-    // Points sampled in the crown: about five per cubic metre of crown, so narrow crowns still branch finely.
-    const volume =
-      shape === 'cone' ? (Math.PI * r * r * crownHeight) / 3 : (4 / 3) * Math.PI * r * r * (crownHeight / 2)
-    const p: TreeParams = {
-      ...base,
-      height: h,
-      trunkHeight: h * crownBase,
-      crownHeight,
-      crownRadius: r,
-      crownShape: shape,
-      attractionPoints: Math.round(Math.min(2000, Math.max(600, volume * 5))),
-      influenceDistance: Math.min(base.influenceDistance, Math.max(1.2, r * 0.9)),
-      baseRadius: Math.min(0.55, Math.max(0.12, h * 0.012)),
-      ...extra
-    }
-    const k = step / 0.33
-    return {
-      ...p,
-      segmentLength: step,
-      killDistance: step * 2,
-      iterations: Math.max(140, Math.round(h / step) + 40),
-      leafDensity: p.leafDensity * Math.min(1.8, k),
-      leafSize: p.leafSize * Math.min(1.25, Math.sqrt(k)),
-      leafDepth: Math.max(2, Math.round(p.leafDepth / Math.min(1.6, k)))
-    }
-  }
-  switch (name) {
-    case 'pine': // lodgepole: a tall clean stem, a short rounded crown at the top, yellow-green needles
-      return sized(
-        presets.pine,
-        {
-          leader: true,
-          tropism: [0, 0.05, 0],
-          jitter: 0.22,
-          leafColor: '#46602c',
-          barkColor: '#6b4a33',
-          leafSize: 0.85,
-          leafDensity: 2.6,
-          leafDepth: 5
-        },
-        'ellipsoid'
-      )
-    case 'spruce': // interior spruce: long dense cone, drooping branches, blue-green
-      return sized(
-        presets.spruce,
-        { tropism: [0, -0.3, 0], leafColor: '#2f4a38', leafSize: 0.95, leafDensity: 2.5, leafDepth: 8 },
-        'cone'
-      )
-    case 'fir': // subalpine fir: a narrow spire, level branches, dark
-      return sized(
-        presets.fir,
-        { tropism: [0, -0.1, 0], jitter: 0.06, leafColor: '#284438', leafSize: 0.9, leafDensity: 2.6, leafDepth: 9 },
-        'cone'
-      )
-    case 'douglasFir': // interior Douglas-fir: broader and less regular, deeply furrowed bark
-      return sized(
-        presets.fir,
-        {
-          tropism: [0, -0.18, 0],
-          jitter: 0.2,
-          leafColor: '#34512f',
-          barkColor: '#5a4232',
-          barkContrast: 0.85,
-          leafSize: 1,
-          leafDensity: 2.4,
-          leafDepth: 7
-        },
-        'cone'
-      )
-    case 'aspen': // trembling aspen: pale green-white bark, small rounded crown, bright leaves
-      return sized(
-        presets.birch,
-        {
-          tropism: [0, 0.06, 0],
-          barkColor: '#c6cab5',
-          barkMarks: 0.45,
-          barkContrast: 0.2,
-          leafColor: '#789a3c',
-          leafSize: 0.5,
-          leafDensity: 2,
-          leafDepth: 3
-        },
-        'ellipsoid'
-      )
-    case 'birch':
-      return sized(presets.birch, { tropism: [0, -0.08, 0], barkColor: '#e0dbd0' }, 'ellipsoid')
-    case SNAG: // a fire-killed stem: a bare charred trunk, a few dead branch stubs, no foliage
-      return sized(
-        presets.deadSnag,
-        {
-          leader: true,
-          tropism: [0, -0.25, 0],
-          jitter: 0.45,
-          attractionPoints: Math.round(Math.min(300, Math.max(80, h * 8))),
-          leafShape: 'none',
-          leafDensity: 0,
-          barkColor: '#463c44',
-          barkContrast: 0.5,
-          barkMarks: 0,
-          baseRadius: Math.min(0.32, Math.max(0.08, h * 0.0095)),
-          tipRadius: 0.025
-        },
-        'cone'
-      )
-    default:
-      return sized(presets.spruce, {}, 'cone')
-  }
-}
 
 /**
  * One species' grown height classes, kept between packages while its crown base, crown ratio and draw distance stay
@@ -204,10 +80,10 @@ export async function standLayers(
   exclude: (x: number, y: number) => boolean = () => false,
   /**
    * The far stand: stems farther than `radius` from the package origin are drawn as a fixed set of their class's
-   * impostors standing on `groundAt` (package metres), never streamed, culled or faded by distance, so a capture's
+   * impostors standing on `groundAt` (package metres), spatially tiled and optionally culled, without distance streaming, so a capture's
    * stems kilometres off are all drawn. Without it (or without impostors) every stem goes to the scatter.
    */
-  far: { radius: number; groundAt: (x: number, y: number) => number } | null = null,
+  far: { radius: number; groundAt: (x: number, y: number) => number; frustumCulling?: boolean } | null = null,
   /**
    * Years since the fire where a stem stands on burnt ground (cover 7), else NaN: the stem is drawn as a snag
    * ({@link SNAG}, its form from `snagForm`), and left out once fallen (`standingSnagShare`).
@@ -218,6 +94,8 @@ export async function standLayers(
   const data = pkg.trees.data
   /** Stems by species (or {@link SNAG}), then by ladder class. */
   const bySpecies = new Map<string, Map<number, number[]>>()
+  const shapes = new Map<string, ReturnType<typeof morphology> & { name: string }>()
+  const rich = pkg.trees.fields.includes('crownBase')
   /** A snag's drawn height and crown width, by stem. */
   const snagged = new Map<number, { height: number; crownWidth: number }>()
   for (let i = 0; i < pkg.trees.count; i++) {
@@ -235,8 +113,16 @@ export async function standLayers(
       s = SNAG
       height = form.height
     }
-    let bins = bySpecies.get(s)
-    if (!bins) bySpecies.set(s, (bins = new Map()))
+    const meta = stemMetadata(pkg.trees, i)
+    const shape = morphology(meta, height, pkg.species[s]?.crownBase ?? 0.3)
+    if (s === SNAG) {
+      shape.crownBase = SNAG_CROWN_BASE
+      shape.trunkRatio = 0.0095
+    }
+    const group = rich ? `${s}|${shape.key}` : s
+    shapes.set(group, { ...shape, name: s })
+    let bins = bySpecies.get(group)
+    if (!bins) bySpecies.set(group, (bins = new Map()))
     const bin = heightBin(height)
     let list = bins.get(bin)
     if (!list) bins.set(bin, (list = []))
@@ -246,30 +132,42 @@ export async function standLayers(
   const used = new Set<string>()
   const layers: ScatterLayer[] = []
   let stems = 0
-  const farMeshes: THREE.Mesh[] = []
+  const farMeshes: THREE.Group[] = []
   let farStems = 0
-  for (const [name, bins] of bySpecies) {
+  for (const [group, bins] of bySpecies) {
+    const shape = shapes.get(group)!
+    const name = shape.name
     const snag = name === SNAG
-    const crownBase = snag ? SNAG_CROWN_BASE : (pkg.species[name]?.crownBase ?? 0.3)
+    const crownBase = rich ? shape.crownBase : snag ? SNAG_CROWN_BASE : (pkg.species[name]?.crownBase ?? 0.3)
     const crownRatio = snag ? SNAG_CROWN_RATIO : pkg.species[name]?.crownRatio
     const key = JSON.stringify([crownBase, crownRatio ?? null, maxDistance])
-    let entry = cache.get(name)
+    let entry = cache.get(group)
     if (entry && entry.key !== key) {
       retired.push([...entry.bins.values()].map((b) => b.layer))
-      cache.delete(name)
+      cache.delete(group)
       entry = undefined
     }
     if (!entry) {
       entry = { key, bins: new Map(), material: null }
-      cache.set(name, entry)
+      cache.set(group, entry)
     }
-    used.add(name)
+    used.add(group)
     const missing = [...bins.keys()].filter((b) => !entry.bins.has(b)).sort((a, b) => a - b)
     if (missing.length) onStatus(`growing ${name} (${missing.map((b) => `${TREE_HEIGHT_LADDER[b]} m`).join(', ')})…`)
     for (const bin of missing)
       entry.bins.set(
         bin,
-        await buildBin(name, bin, crownBase, binCrownWidth(name, bin, crownRatio), entry, renderer, maxDistance)
+        await buildBin(
+          name,
+          bin,
+          crownBase,
+          binCrownWidth(name, bin, crownRatio),
+          entry,
+          renderer,
+          maxDistance,
+          rich ? shape.trunkRatio : undefined,
+          rich ? shape.form : 0
+        )
       )
 
     // Classes in ladder order, each stem scaled from its class's measured size to its own.
@@ -285,12 +183,13 @@ export async function standLayers(
         const yaw = (data[o + 6] * 6.283185 + data[o] * 0.37) % 6.283185
         const into = data[o] * data[o] + data[o + 1] * data[o + 1] > farRadius2 ? farList : list
         const form = snagged.get(i)
-        // Never stretched sideways past 1.5 × its grown shape (`cappedWidthScale`): closure is the stand's, not a stem's.
+        // Rich stands retain each measured crown width; legacy packages keep their earlier shape limit.
         const tall = (form ? form.height : data[o + 4]) / m.height
-        into.push(data[o], -data[o + 1], yaw, cappedWidthScale((form ? form.crownWidth : data[o + 5]) / m.width, tall), tall)
+        const width = (form ? form.crownWidth : data[o + 5]) / m.width
+        into.push(data[o], -data[o + 1], yaw, rich ? width : cappedWidthScale(width, tall), tall)
       }
       if (farList.length && far && built.impostor) {
-        farMeshes.push(farStandMesh(built.impostor, farList, far.groundAt, `${name}@${TREE_HEIGHT_LADDER[bin]}`))
+        farMeshes.push(farStandTiles(built.impostor, farList, far.groundAt, `${name}@${TREE_HEIGHT_LADDER[bin]}`))
         farStems += farList.length / FIXED_INSTANCE_STRIDE
       }
       const layer = built.layer
@@ -301,24 +200,28 @@ export async function standLayers(
       layers.push(layer)
     }
   }
-  for (const [name, entry] of cache)
-    if (!used.has(name)) {
+  for (const [group, entry] of cache)
+    if (!used.has(group)) {
       retired.push([...entry.bins.values()].map((b) => b.layer))
-      cache.delete(name)
+      cache.delete(group)
     }
   let farStand: FarStand | null = null
   if (farMeshes.length) {
     const object = new THREE.Group()
     object.name = 'far stand'
     object.add(...farMeshes)
+    setFarCulling(object, far?.frustumCulling ?? true)
     farStand = {
       object,
       stems: farStems,
+      setCulling(enabled) {
+        setFarCulling(object, enabled)
+      },
       dispose() {
-        // Never `dispose()`d: each geometry shares the cached class's quad buffers, which a dispose would free while
-        // the class still draws with them (three.js also frees a render object's other attributes). Reclaimed by
-        // garbage collection, as the scatter's retired pools are.
         object.removeFromParent()
+        object.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) (child as THREE.Mesh).geometry.dispose()
+        })
       }
     }
   }
@@ -329,6 +232,7 @@ export async function standLayers(
 export interface FarStand {
   object: THREE.Group
   stems: number
+  setCulling(enabled: boolean): void
   dispose(): void
 }
 
@@ -336,43 +240,6 @@ export interface FarStand {
 const COLOR_VARIATION = 0.12
 /** How far a stem is sunk into the ground (`layer.sink`, set in `buildBin`). */
 const SINK = 0.05
-
-/**
- * A class's far stems as its own impostor: the same quad and material the scatter draws past the coarse mesh, fed the
- * same per-stem attributes the scatter writes (`scatterPosition`: base and height scale; `scatterParams`: yaw, tint,
- * random, width ÷ height), from a list of `x, z, yaw, width scale, height scale` in three.js axes.
- */
-function farStandMesh(
-  impostor: NonNullable<ScatterLayer['impostor']>,
-  list: number[],
-  groundAt: (x: number, y: number) => number,
-  name: string
-): THREE.Mesh {
-  const count = list.length / FIXED_INSTANCE_STRIDE
-  const position = new Float32Array(count * 4)
-  const params = new Float32Array(count * 4)
-  for (let n = 0; n < count; n++) {
-    const o = n * FIXED_INSTANCE_STRIDE
-    const [x, z, yaw, width, tall] = [list[o], list[o + 1], list[o + 2], list[o + 3], list[o + 4]]
-    const u = hash(Math.floor(x * 1000), Math.floor(z * 1000), 0x5ca7) / 4294967296
-    position.set([x, groundAt(x, -z) - SINK, z, tall], n * 4)
-    params.set([yaw, 1 + (u * 2 - 1) * COLOR_VARIATION, u, tall > 0 ? width / tall : 1], n * 4)
-  }
-  const source = impostor.geometry
-  const geometry = new THREE.InstancedBufferGeometry()
-  geometry.setIndex(source.index)
-  for (const [key, attribute] of Object.entries(source.attributes)) geometry.setAttribute(key, attribute)
-  geometry.setAttribute('scatterPosition', new THREE.InstancedBufferAttribute(position, 4))
-  geometry.setAttribute('scatterParams', new THREE.InstancedBufferAttribute(params, 4))
-  geometry.instanceCount = count
-  const mesh = new THREE.Mesh(geometry, impostor.material)
-  mesh.name = `${name}:far`
-  mesh.frustumCulled = false
-  mesh.matrixAutoUpdate = false
-  mesh.castShadow = false
-  mesh.receiveShadow = false
-  return mesh
-}
 
 /** Grows one height class of a species. The first class grown sets the materials the species' later classes share. */
 async function buildBin(
@@ -382,10 +249,12 @@ async function buildBin(
   width: number,
   entry: SpeciesEntry,
   renderer: THREE.WebGPURenderer | null,
-  maxDistance: number
+  maxDistance: number,
+  trunkRatio?: number,
+  form = 0
 ): Promise<BinEntry> {
   const height = TREE_HEIGHT_LADDER[bin]
-  const params = recipe(name, height, width, crownBase)
+  const params = recipe(name, height, width, crownBase, trunkRatio, form)
   const id = `${name}@${height}`
   const seed = binSeed(name, bin)
   // createVegetationLayers scales its distances by size / 15 m; undo that so the levels end where we say.

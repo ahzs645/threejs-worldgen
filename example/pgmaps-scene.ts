@@ -81,6 +81,11 @@ import { syntheticStand } from './pgmaps-far-forest-math'
 import { SCENE_UNBUILT_FIELDS, scenePackageKey } from './pgmaps-capture-math'
 import { ACCEPTS, unpackArrays } from './pgmaps-packed'
 import { viewYear } from './pgmaps-burn'
+import { FramePacer, mergeRenderOptions, renderOptionsFromParams, type RenderOptions } from './pgmaps-render-options'
+import { mountTreated, type TreatedTable } from './pgmaps-treated'
+import { setFarCulling } from './pgmaps-far-cards'
+import { gpuCompletion } from './pgmaps-gpu-pacing'
+import { standMetadataSummary } from './pgmaps-stand-fields'
 import {
   alignmentCheck,
   createCapturer,
@@ -100,6 +105,7 @@ type ScenePackage = GroundInput &
     camera: PackageCamera
     environment?: EnvironmentInput
     treeRadiusMeters: number
+    treated?: TreatedTable
   }
 type PackageCamera = {
   position: [number, number, number]
@@ -112,6 +118,12 @@ type PackageCamera = {
 const ENGINE = 'worldgen'
 // (a worker's location is its script's address, with the options PGMaps put on it: `?embed`)
 const params = new URLSearchParams(location.search)
+let renderOptions = renderOptionsFromParams(params)
+let capturing = false
+let captureLiveOptions: RenderOptions | null = null
+let resizePending = false
+const pacer = new FramePacer()
+let gpuFailureReported = false
 const embedded = host.embedded
 const status = (text: string) => host.status(text)
 const toParent = (message: Record<string, unknown>, transfer: Transferable[] = []) =>
@@ -124,11 +136,31 @@ const pageState = <T = Record<string, unknown>>() => host.state<T>()
 await host.ready
 const view0 = host.viewport()
 const renderer = new THREE.WebGPURenderer({ canvas: host.canvas(), antialias: true, forceWebGL: params.has('webgl') })
-renderer.setPixelRatio(Math.min(view0.pixelRatio, 1.5))
+renderer.setPixelRatio(Math.min(view0.pixelRatio, 1.5) * renderOptions.resolutionScale)
 // (an OffscreenCanvas has no style to size: PGMaps sizes and places the element it handed over)
 renderer.setSize(view0.width, view0.height, !host.worker)
 host.mount(renderer.domElement)
 await renderer.init()
+const gpuWork = gpuCompletion(renderer.backend)
+pacer.onFailure = (error) => {
+  if (gpuFailureReported) return
+  gpuFailureReported = true
+  const message = `GPU ${gpuWork.backend} completion failed: ${error}`
+  status(message)
+  toParent({ type: 'pgmaps-engine-error', message })
+  const state = pageState()
+  if (state) state.gpu = { backend: gpuWork.backend, failed: pacer.failed, lastError: error, inFlight: pacer.inFlight }
+  void pacer.drain().then(() => {
+    const state = pageState()
+    if (state)
+      state.gpu = {
+        backend: gpuWork.backend,
+        failed: pacer.failed,
+        lastError: pacer.lastError,
+        inFlight: pacer.inFlight
+      }
+  })
+}
 
 const scene = new THREE.Scene()
 const camera = new THREE.PerspectiveCamera(40, view0.width / view0.height, 0.3, 8000) // LIVE_FAR
@@ -165,12 +197,17 @@ let savedProjection: CameraProjection | undefined
 let viewWidth = view0.width
 let viewHeight = view0.height
 const resize = () => {
+  if (capturing) {
+    resizePending = true
+    return
+  }
+  resizePending = false
   const box = host.viewport()
   const view = fitCameraViewport(savedProjection, box.width, box.height)
   camera.aspect = view.aspect
   camera.updateProjectionMatrix()
-  if (Math.min(box.pixelRatio, 1.5) !== renderer.getPixelRatio()) {
-    renderer.setPixelRatio(Math.min(box.pixelRatio, 1.5))
+  if (Math.min(box.pixelRatio, 1.5) * renderOptions.resolutionScale !== renderer.getPixelRatio()) {
+    renderer.setPixelRatio(Math.min(box.pixelRatio, 1.5) * renderOptions.resolutionScale)
     viewWidth = 0 // (the drawing buffer changes size with it)
   }
   if (viewWidth !== view.width || viewHeight !== view.height) {
@@ -179,6 +216,22 @@ const resize = () => {
     viewHeight = view.height
   }
   host.place(renderer.domElement, view)
+}
+
+function applyRenderOptions(input: unknown, liveResize = true, captureOverride = false) {
+  if (captureLiveOptions && !captureOverride) {
+    captureLiveOptions = mergeRenderOptions(captureLiveOptions, input)
+    return
+  }
+  renderOptions = mergeRenderOptions(renderOptions, input)
+  current?.farForest.configure(renderOptions)
+  if (current) {
+    current.scatter.set({ cullMargin: renderOptions.frustumCulling && framesSinceBuild >= 3 ? CULL_MARGIN : 0 })
+    setFarCulling(current.treated.object, renderOptions.frustumCulling)
+  }
+  if (liveResize) resize()
+  const state = pageState()
+  if (state) state.renderOptions = { ...renderOptions }
 }
 
 /** Stands the camera at a package eye: position in package metres, bearing clockwise from north, pitch up. */
@@ -216,10 +269,12 @@ type Built = {
    * single cards for the package's far stems on open ground (pgmaps-far-forest.ts).
    */
   farForest: FarForest
+  treated: ReturnType<typeof mountTreated>
   /** Stems the scatter draws (the package's within its near stand, on dry ground). */
   stems: number
   seat: SeatRecord
   maxDistance: number
+  metadata: ReturnType<typeof standMetadataSummary>
   dispose(): void
 }
 
@@ -265,6 +320,7 @@ let baking = false
 async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
   if (pkg?.format !== 'pgmaps-forest-scene' || pkg.version !== 1)
     throw new Error('Not a PGMaps forest scene package (v1).')
+  await pacer.drain()
   status('building the ground…')
   // The road view's package (stems to 600 m) streams every stem through the scatter, as it always has. A capture's
   // package reaches kilometres: its stems past NEAR_STAND go to the far stand, fixed impostor cards drawn however far.
@@ -305,7 +361,10 @@ async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
   })
   status('baking the far forest…')
   const farForest = buildFarForest(pkg, ground, farReach ? nearStand : pkg.treeRadiusMeters, farStems)
+  const treated = mountTreated(ground.group, pkg.treated, ground.groundAt, ground.inWater)
   ground.group.add(farForest.object)
+  farForest.configure(renderOptions)
+  setFarCulling(treated.object, renderOptions.frustumCulling)
   console.log(`fixed instances: ${stand.stems} (${stand.snags} snags on burnt ground)`)
   const seat = seatRecord(pkg, ground)
   const scatter = Scatter.create({
@@ -325,12 +384,15 @@ async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
     scatter,
     ground,
     farForest,
+    treated,
     stems: stand.stems,
     seat,
     maxDistance,
+    metadata: standMetadataSummary(pkg.trees),
     dispose() {
       scatter.dispose()
       farForest.dispose()
+      treated.dispose()
       ground.dispose()
     }
   }
@@ -359,8 +421,6 @@ let framesSinceBuild = 0
 let announced = false
 
 // ---------------------------------------------------------------- captures (pgmaps-capture.ts)
-/** True while a capture holds the camera and the renderer; the frame loop draws nothing. */
-let capturing = false
 const capturer = createCapturer({
   renderer,
   scene,
@@ -372,7 +432,30 @@ const capturer = createCapturer({
     return current
   },
   hold(on) {
-    capturing = on
+    capturing = on || captureLiveOptions !== null
+  },
+  renderOptions: () => ({ ...renderOptions }),
+  async captureOptions(input) {
+    if (gpuFailureReported) throw new Error(`GPU completion failed: ${pacer.lastError}`)
+    capturing = true
+    captureLiveOptions = { ...renderOptions }
+    await pacer.drain()
+    if (gpuFailureReported) {
+      capturing = false
+      captureLiveOptions = null
+      throw new Error(`GPU completion failed: ${pacer.lastError}`)
+    }
+    applyRenderOptions(input, false, true)
+    return () => {
+      const live = captureLiveOptions!
+      captureLiveOptions = null
+      const changedSize = live.resolutionScale !== renderOptions.resolutionScale
+      applyRenderOptions(live, false)
+      capturing = false
+      if (resizePending || changedSize) resize()
+      if (parentCamera) setCamera(parentCamera)
+      if (pending && !building) void load(pending)
+    }
   },
   prepare: prepareFrame
 })
@@ -400,6 +483,7 @@ async function captureForPage(request?: CaptureRequest, options: { size?: [numbe
     engine: reply.engine,
     scene: reply.scene,
     environment: reply.environment,
+    renderOptions: reply.renderOptions,
     maxTreeHeightMeters: reply.maxTreeHeightMeters,
     missing: reply.missing,
     missingDetail: reply.missingDetail,
@@ -476,7 +560,7 @@ const postedKeys = new WeakMap<ScenePackage, string>()
 
 async function load(pkg: ScenePackage) {
   pending = pkg
-  if (building) return
+  if (building || capturing) return
   building = true
   try {
     while (pending) {
@@ -541,6 +625,15 @@ async function load(pkg: ScenePackage) {
           capture: captureForPage,
           syntheticStand: syntheticStandFor,
           ready: false,
+          renderOptions: { ...renderOptions },
+          treated: built.treated.object,
+          standMetadata: {
+            summary: built.metadata,
+            fields: built.pkg.trees.fields,
+            ids: built.pkg.trees.ids ?? null,
+            expansion: 'metadata; each record is rendered once',
+            morphology: 'crown-base classes of 0.2; six trunk slenderness classes when DBH is known'
+          },
           /** Whether this package kept the scene already built, and what telling took (the content hash), ms. */
           package: { kept, hashMs: Math.round(hashMs) }
         }
@@ -559,7 +652,7 @@ async function load(pkg: ScenePackage) {
 
 addEventListener('message', (event: MessageEvent) => {
   const data = event.data as { type?: string; scene?: ScenePackage; key?: unknown } & Partial<PackageCamera> &
-    EnvironmentInput
+    EnvironmentInput & { options?: Partial<RenderOptions> }
   if (data?.type === 'pgmaps-scene' && data.scene) {
     // PGMaps may send the long numeric arrays packed (pgmaps-packed.ts): back to the plain arrays a build reads.
     unpackArrays(data.scene)
@@ -581,7 +674,7 @@ addEventListener('message', (event: MessageEvent) => {
       verticalFovDegrees: data.verticalFovDegrees ?? camera.fov,
       projection: data.projection
     }
-    if (current) setCamera(parentCamera)
+    if (current && !capturing) setCamera(parentCamera)
   } else if (data?.type === 'pgmaps-capture') {
     const request = event.data as CaptureRequest
     // (the reply goes back the way the request came: to the page that sent it, or to PGMaps from a worker)
@@ -627,6 +720,8 @@ addEventListener('message', (event: MessageEvent) => {
             error: error instanceof Error ? error.message : String(error)
           })
       )
+  } else if (data?.type === 'pgmaps-render-options') {
+    applyRenderOptions(data.options)
   } else if (data?.type === 'pgmaps-environment') {
     environmentOverridden = true
     // Light, sky and weather only: the stand and ground stay as built.
@@ -656,7 +751,8 @@ host.expose({
     capture: captureForPage,
     syntheticStand: syntheticStandFor,
     ready: false,
-    environment: { ...atmosphere.applied }
+    environment: { ...atmosphere.applied },
+    renderOptions: { ...renderOptions }
   }
 })
 if (embedded && !params.get('scene')) {
@@ -676,6 +772,7 @@ if (embedded && !params.get('scene')) {
 let last = performance.now()
 let fps = 30
 let lastStats = 0
+let lastCompleted = 0
 const start = performance.now()
 const follow = new THREE.Vector3()
 const ahead = new THREE.Vector3()
@@ -714,7 +811,10 @@ function prepareFrame(now: number, fit?: { centre: THREE.Vector3; radius: number
     const far = current.farForest
     far.update(sunDirection)
     // The dissolve distance follows the frame: a median tree under 4 px tall (a capture pins its own).
-    if (!far.pinned) far.setCutoff(far.cutoffFor(bufferSize.y, camera.fov))
+    if (!far.pinned)
+      far.setCutoff(
+        far.cutoffFor(bufferSize.y, camera.fov, undefined, undefined, [camera.position.x, -camera.position.z])
+      )
     const water = current.ground.water
     if (water) {
       water.lakes.update()
@@ -729,22 +829,23 @@ function prepareFrame(now: number, fit?: { centre: THREE.Vector3; radius: number
 }
 renderer.setAnimationLoop(() => {
   // A capture has the camera and the renderer: the canvas keeps its last frame meanwhile.
-  if (capturing) return
+  if (capturing || gpuFailureReported) return
   const now = performance.now()
+  controls.update()
+  if (baking || !pacer.canSubmit(now, renderOptions)) return
   fps = fps * 0.9 + (1000 / Math.max(1, now - last)) * 0.1
   last = now
-  controls.update()
-  if (baking) return
   prepareFrame(now)
   pipeline.render()
+  pacer.submitted(now, gpuWork.done())
   if (!current) return
   const s = current.scatter.stats
   status(
     `${fps.toFixed(0)} fps · ${current.stems} stems in the package · instances ${s.instances} · drawn ${s.visible} · meshes ${s.meshes}`
   )
   framesSinceBuild += 1
-  if (framesSinceBuild === 3) current.scatter.set({ cullMargin: CULL_MARGIN })
-  const state = pageState<{ ready: boolean }>() ?? { ready: false }
+  if (framesSinceBuild === 3) current.scatter.set({ cullMargin: renderOptions.frustumCulling ? CULL_MARGIN : 0 })
+  const state = pageState<{ ready: boolean; gpu?: Record<string, unknown> }>() ?? { ready: false }
   const streamed = s.instances >= current.stems
   // A (new) scene's first full frame: every stem streamed in, or long enough that the rest are out of reach.
   if (!announced && framesSinceBuild > 2 && (streamed || framesSinceBuild > 120)) {
@@ -752,13 +853,34 @@ renderer.setAnimationLoop(() => {
     toParent({ type: 'pgmaps-engine-ready' })
   }
   if (now - lastStats > 1000) {
+    const completedFps = ((pacer.completed - lastCompleted) * 1000) / Math.max(1, now - lastStats)
+    lastCompleted = pacer.completed
     lastStats = now
+    const gpu = {
+      backend: gpuWork.backend,
+      inFlight: pacer.inFlight,
+      completed: pacer.completed,
+      failed: pacer.failed,
+      failures: pacer.failed,
+      lastError: pacer.lastError,
+      completedFps: Math.round(completedFps * 10) / 10,
+      completionLatencyMs: Math.round(pacer.completionMs * 10) / 10
+    }
+    state.gpu = gpu
     toParent({
       type: 'pgmaps-engine-stats',
       drawn: s.visible,
       instances: s.instances,
       meshes: s.meshes,
       fps: Math.round(fps),
+      renderOptions: { ...renderOptions },
+      gpu,
+      queue: gpu,
+      completedFps: gpu.completedFps,
+      renderer: { memory: { ...renderer.info.memory }, render: { ...renderer.info.render } },
+      farForest: { ...current.farForest.stats, cutoffMeters: current.farForest.cutoff },
+      treatedStems: current.treated.stems,
+      standMetadata: current.metadata,
       stems: current.stems,
       seatAdjustMaxM: current.seat.maxM,
       seatAdjustMeanM: current.seat.meanM,

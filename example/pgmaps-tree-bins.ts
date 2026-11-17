@@ -35,7 +35,10 @@ export const DEFAULT_CROWN_RATIO: Readonly<Record<string, number>> = {
   fir: 0.12,
   douglasFir: 0.2,
   aspen: 0.22,
-  birch: 0.2
+  birch: 0.2,
+  hemlock: 0.18,
+  blackSpruce: 0.12,
+  cottonwood: 0.32
 }
 const FALLBACK_CROWN_RATIO = 0.17
 
