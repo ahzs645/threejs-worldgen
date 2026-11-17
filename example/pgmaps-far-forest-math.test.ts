@@ -60,7 +60,8 @@ test('coverage-preserving mips keep an alpha-tested tree card’s coverage at ev
   const w = 64
   const h = 64
   const data = new Uint8Array(w * h * 4)
-  for (let k = 0; k < 4; k++) for (let y = 0; y < h; y++) data.set(tree.data.subarray(y * 16 * 4, (y + 1) * 16 * 4), (y * w + k * 16) * 4)
+  for (let k = 0; k < 4; k++)
+    for (let y = 0; y < h; y++) data.set(tree.data.subarray(y * 16 * 4, (y + 1) * 16 * 4), (y * w + k * 16) * 4)
   const alphaOf = (level: { data: Uint8Array; width: number; height: number }) =>
     Uint8Array.from({ length: level.width * level.height }, (_, i) => level.data[i * 4 + 3])
   const base = alphaCoverage(alphaOf({ data, width: w, height: h }), 0.5)
@@ -73,13 +74,22 @@ test('coverage-preserving mips keep an alpha-tested tree card’s coverage at ev
     for (let y = 0; y < level.height; y++)
       for (let x = 0; x < level.width; x++) {
         let a = 0
-        for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) a += plain.data[((2 * y + dy) * plain.width + 2 * x + dx) * 4 + 3]
+        for (const [dx, dy] of [
+          [0, 0],
+          [1, 0],
+          [0, 1],
+          [1, 1]
+        ])
+          a += plain.data[((2 * y + dy) * plain.width + 2 * x + dx) * 4 + 3]
         half[(y * level.width + x) * 4 + 3] = Math.round(a / 4)
       }
     plain = { data: half, width: level.width, height: level.height }
     const coverage = alphaCoverage(alphaOf(level), 0.5)
     const plainCoverage = alphaCoverage(alphaOf(plain), 0.5)
-    assert.ok(Math.abs(coverage - base) <= Math.abs(plainCoverage - base) + 1e-9, `${level.width}: ${coverage} vs plain ${plainCoverage}, base ${base}`)
+    assert.ok(
+      Math.abs(coverage - base) <= Math.abs(plainCoverage - base) + 1e-9,
+      `${level.width}: ${coverage} vs plain ${plainCoverage}, base ${base}`
+    )
     assert.ok(Math.abs(coverage - base) < 0.06, `${level.width}: ${coverage} vs ${base}`)
   }
   assert.ok(coverageScale([100, 100, 0, 0], 0.5, 0.5) > 1.27)
@@ -270,7 +280,7 @@ test('a stand over its stem cap is thinned evenly, never cut off at the rows rea
   assert.ok(capped.count <= Math.round(full.count / 4) && capped.count > full.count / 5)
   let north = 0
   let south = 0
-  for (let i = 0; i < capped.count; i++) (capped.data[i * 7 + 1] > 0 ? north++ : south++)
+  for (let i = 0; i < capped.count; i++) capped.data[i * 7 + 1] > 0 ? north++ : south++
   assert.ok(north > 0.4 * capped.count && south > 0.4 * capped.count, `north ${north}, south ${south}`)
 })
 
@@ -336,8 +346,7 @@ test('the table of sRGB steps gives the very bytes of the formula, at every step
   }
   for (let i = 0; i < 200000; i++) values.push(random() * 1.1 - 0.05, random() ** 5, Math.fround(random() * 24) / 24)
   const bytes = linearToSrgbBytes(values)
-  for (let i = 0; i < values.length; i++)
-    assert.equal(bytes[i], linearToSrgbByte(values[i]) || 0, `at ${values[i]}`)
+  for (let i = 0; i < values.length; i++) assert.equal(bytes[i], linearToSrgbByte(values[i]) || 0, `at ${values[i]}`)
 })
 
 test('samples added up in linear light average to the mean picture, opaque', () => {

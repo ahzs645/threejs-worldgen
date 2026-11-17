@@ -75,7 +75,8 @@ export function coverageMips(
   // Each cell's base coverage.
   const base: number[] = []
   for (let r = 0; r < rows; r++)
-    for (let c = 0; c < columns; c++) base.push(cellCoverage(atlas, c * cellWidth, r * cellHeight, cellWidth, cellHeight, threshold))
+    for (let c = 0; c < columns; c++)
+      base.push(cellCoverage(atlas, c * cellWidth, r * cellHeight, cellWidth, cellHeight, threshold))
   let cw = cellWidth
   let ch = cellHeight
   let prev = atlas

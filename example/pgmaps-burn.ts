@@ -104,7 +104,8 @@ export function burnAgeSampler(input: FireInput): ((x: number, y: number) => num
   const since = new Map<number, number>()
   for (const fire of input.fires ?? []) {
     const years = fire?.yearsSinceFire ?? fire?.yearsSince
-    if (typeof fire?.year === 'number' && typeof years === 'number' && Number.isFinite(years)) since.set(fire.year, years)
+    if (typeof fire?.year === 'number' && typeof years === 'number' && Number.isFinite(years))
+      since.set(fire.year, years)
   }
   const ageOf = (season: number) => {
     const known = since.get(season)

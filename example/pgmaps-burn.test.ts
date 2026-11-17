@@ -66,7 +66,10 @@ test("years since the fire: the post's season (PGMaps burntYear), aged by the pa
   assert.equal(age(4, 4), 4)
   assert.ok(Number.isNaN(age(50, 50)))
   // A season the fires table does not list is aged by the view's year; a later season reads 0.
-  const bare = burnAgeSampler({ terrain: grid([2019, 2030, null, null]), environment: { dateTime: '2025-07-01T12:00' } })!
+  const bare = burnAgeSampler({
+    terrain: grid([2019, 2030, null, null]),
+    environment: { dateTime: '2025-07-01T12:00' }
+  })!
   assert.equal(bare(0, 0), 6)
   assert.equal(bare(10, 0), 0)
   assert.ok(Number.isNaN(burnAgeSampler({ terrain: grid([2019, null, null, null]) })!(0, 0)))

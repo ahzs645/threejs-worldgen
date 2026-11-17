@@ -453,9 +453,33 @@ const samplePackage = () => {
       pine: { crownRatio: 0.14, crownBase: 0.54, broadleaf: false },
       spruce: { crownBase: 0.3, broadleaf: false }
     },
-    openings: [{ kind: 'harvested', rings: [[[-6, 2], [4, 2], [4, 9], [-6, 2]]], ageYears: 3, retainedShare: null }],
+    openings: [
+      {
+        kind: 'harvested',
+        rings: [
+          [
+            [-6, 2],
+            [4, 2],
+            [4, 9],
+            [-6, 2]
+          ]
+        ],
+        ageYears: 3,
+        retainedShare: null
+      }
+    ],
     debris: { fields: ['x', 'y', 'z', 'kind'], count: 0, data: [] },
-    roadScars: [{ kind: 'fill', ring: [[-3, 1], [0, 1], [0, 2], [-3, 1]] }],
+    roadScars: [
+      {
+        kind: 'fill',
+        ring: [
+          [-3, 1],
+          [0, 1],
+          [0, 2],
+          [-3, 1]
+        ]
+      }
+    ],
     water: [],
     fires: [{ fireNumber: 'N71650', year: 2024, yearsSinceFire: 2 }],
     camera: { position: [0, 0, 559.6], bearingDegrees: 90, pitchDegrees: -5.5, verticalFovDegrees: 36.9 },

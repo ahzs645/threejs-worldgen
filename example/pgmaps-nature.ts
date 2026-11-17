@@ -189,7 +189,10 @@ export const onBareGround = (weights: ArrayLike<number> | null, standing = false
  * The sea's drawn level `distance` metres from the eye on the skyline grid, whose heights carry the earth's curve
  * (PGMaps `earthCurvature`): 0 − d² / (2R) × (1 − k).
  */
-export function droppedSeaLevel(distance: number, curvature: { earthRadiusMeters: number; refraction: number }): number {
+export function droppedSeaLevel(
+  distance: number,
+  curvature: { earthRadiusMeters: number; refraction: number }
+): number {
   return -((distance * distance) / (2 * curvature.earthRadiusMeters)) * (1 - curvature.refraction)
 }
 

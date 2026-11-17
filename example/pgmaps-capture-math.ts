@@ -714,7 +714,9 @@ export function contentHash(value: unknown, skip?: ReadonlySet<string>): string 
       }
       const prototype = Object.getPrototypeOf(v)
       if (prototype === Object.prototype || prototype === null) {
-        const keys = Object.keys(v).filter((key) => !skipKeys?.has(key)).sort()
+        const keys = Object.keys(v)
+          .filter((key) => !skipKeys?.has(key))
+          .sort()
         word(HASH_TAG.object)
         word(keys.length)
         for (const key of keys) {
