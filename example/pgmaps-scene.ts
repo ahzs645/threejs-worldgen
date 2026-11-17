@@ -86,6 +86,7 @@ import { mountTreated, type TreatedTable } from './pgmaps-treated'
 import { setFarCulling } from './pgmaps-far-cards'
 import { gpuCompletion } from './pgmaps-gpu-pacing'
 import { standMetadataSummary } from './pgmaps-stand-fields'
+import { EngineFailure } from './pgmaps-engine-failure'
 import {
   alignmentCheck,
   createCapturer,
@@ -123,13 +124,30 @@ let capturing = false
 let captureLiveOptions: RenderOptions | null = null
 let resizePending = false
 const pacer = new FramePacer()
-let gpuFailureReported = false
+const failure = new EngineFailure()
 const embedded = host.embedded
-const status = (text: string) => host.status(text)
+const status = (text: string) => host.status(failure.progress(text))
 const toParent = (message: Record<string, unknown>, transfer: Transferable[] = []) =>
   host.post({ engine: ENGINE, ...message }, transfer)
 /** The global state for checking from the page (`window.pgmaps`; the worker's global in a worker). */
 const pageState = <T = Record<string, unknown>>() => host.state<T>()
+const gpuFailureState = () => ({
+  backend: gpuWork.backend,
+  failed: pacer.failed,
+  lastError: pacer.lastError,
+  inFlight: pacer.inFlight
+})
+const expose = (values: { pgmaps: Record<string, unknown> }) => {
+  values.pgmaps = failure.decorate(values.pgmaps)
+  if (failure.failed) values.pgmaps.gpu = gpuFailureState()
+  host.expose(values)
+}
+function preserveFailure() {
+  const state = pageState() ?? {}
+  Object.assign(state, failure.decorate(state), { gpu: gpuFailureState() })
+  expose({ pgmaps: state })
+  status('')
+}
 
 // ---------------------------------------------------------------- the renderer, camera and sky: made once
 // (in a worker, once PGMaps has handed over the canvas)
@@ -143,23 +161,10 @@ host.mount(renderer.domElement)
 await renderer.init()
 const gpuWork = gpuCompletion(renderer.backend)
 pacer.onFailure = (error) => {
-  if (gpuFailureReported) return
-  gpuFailureReported = true
   const message = `GPU ${gpuWork.backend} completion failed: ${error}`
-  status(message)
-  toParent({ type: 'pgmaps-engine-error', message })
-  const state = pageState()
-  if (state) state.gpu = { backend: gpuWork.backend, failed: pacer.failed, lastError: error, inFlight: pacer.inFlight }
-  void pacer.drain().then(() => {
-    const state = pageState()
-    if (state)
-      state.gpu = {
-        backend: gpuWork.backend,
-        failed: pacer.failed,
-        lastError: pacer.lastError,
-        inFlight: pacer.inFlight
-      }
-  })
+  if (!failure.report(message, (message) => toParent({ type: 'pgmaps-engine-error', message }))) return
+  preserveFailure()
+  void pacer.drain().then(preserveFailure)
 }
 
 const scene = new THREE.Scene()
@@ -321,6 +326,7 @@ async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
   if (pkg?.format !== 'pgmaps-forest-scene' || pkg.version !== 1)
     throw new Error('Not a PGMaps forest scene package (v1).')
   await pacer.drain()
+  failure.check()
   status('building the ground…')
   // The road view's package (stems to 600 m) streams every stem through the scatter, as it always has. A capture's
   // package reaches kilometres: its stems past NEAR_STAND go to the far stand, fixed impostor cards drawn however far.
@@ -333,6 +339,10 @@ async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
     treeRadius: nearStand,
     sky: atmosphere.skyTexture
   })
+  if (failure.failed) {
+    ground.dispose()
+    failure.check()
+  }
   baking = true
   // The scatter takes the stems within the near stand; the far forest stands for every one past it.
   const near2 = nearStand * nearStand
@@ -355,10 +365,21 @@ async function build(pkg: ScenePackage, key: string | null): Promise<Built> {
     (x, y) => ground.inWater(x, y) || ground.onBare(x, y) || (farReach && x * x + y * y > near2),
     null,
     // Stems on burnt posts (cover 7) stand as snags (pgmaps-burn.ts).
-    (x, y) => ground.burntAge(x, y)
-  ).finally(() => {
-    baking = false
-  })
+    (x, y) => ground.burntAge(x, y),
+    () => failure.check()
+  )
+    .catch((error) => {
+      ground.dispose()
+      throw error
+    })
+    .finally(() => {
+      baking = false
+    })
+  if (failure.failed) {
+    ground.dispose()
+    stand.far?.dispose()
+    failure.check()
+  }
   status('baking the far forest…')
   const farForest = buildFarForest(pkg, ground, farReach ? nearStand : pkg.treeRadiusMeters, farStems)
   const treated = mountTreated(ground.group, pkg.treated, ground.groundAt, ground.inWater)
@@ -436,11 +457,11 @@ const capturer = createCapturer({
   },
   renderOptions: () => ({ ...renderOptions }),
   async captureOptions(input) {
-    if (gpuFailureReported) throw new Error(`GPU completion failed: ${pacer.lastError}`)
+    if (failure.failed) throw new Error(`GPU completion failed: ${pacer.lastError}`)
     capturing = true
     captureLiveOptions = { ...renderOptions }
     await pacer.drain()
-    if (gpuFailureReported) {
+    if (failure.failed) {
       capturing = false
       captureLiveOptions = null
       throw new Error(`GPU completion failed: ${pacer.lastError}`)
@@ -559,11 +580,16 @@ if (params.has('captureTest')) {
 const postedKeys = new WeakMap<ScenePackage, string>()
 
 async function load(pkg: ScenePackage) {
+  if (failure.failed) {
+    preserveFailure()
+    return
+  }
   pending = pkg
   if (building || capturing) return
   building = true
   try {
     while (pending) {
+      failure.check()
       const next = pending
       pending = null
       // PGMaps sends the package with every job, a structured clone each time: the same content (every array, every
@@ -592,6 +618,10 @@ async function load(pkg: ScenePackage) {
         console.log(`[scene] the same package again: the built scene is kept (hashed in ${hashMs.toFixed(0)} ms)`)
       } else {
         const built = await build(next, key)
+        if (failure.failed) {
+          built.dispose()
+          failure.check()
+        }
         current?.dispose()
         capturer.forgetMaterials() // class-pass copies of the old stand's materials
         disposeRetiredStands() // species the new package no longer uses, now nothing draws them
@@ -612,7 +642,7 @@ async function load(pkg: ScenePackage) {
       setCamera(parentCamera ?? next.camera)
       framesSinceBuild = 0
       announced = false
-      host.expose({
+      expose({
         pgmaps: {
           scene,
           camera,
@@ -641,10 +671,15 @@ async function load(pkg: ScenePackage) {
       applyEnvironment()
     }
   } catch (error) {
+    if (failure.failed) {
+      pending = null
+      preserveFailure()
+      return
+    }
     const message = error instanceof Error ? error.message : String(error)
     status(`failed: ${message}`)
     toParent({ type: 'pgmaps-engine-error', message })
-    host.expose({ pgmaps: { ready: true, error: message } })
+    expose({ pgmaps: { ready: true, error: message } })
   } finally {
     building = false
   }
@@ -741,7 +776,7 @@ async function fromUrlOrFile(): Promise<ScenePackage> {
   })
 }
 
-host.expose({
+expose({
   pgmaps: {
     scene,
     camera,
@@ -762,6 +797,10 @@ if (embedded && !params.get('scene')) {
   fromUrlOrFile()
     .then(load)
     .catch((error) => {
+      if (failure.failed) {
+        preserveFailure()
+        return
+      }
       const message = error instanceof Error ? error.message : String(error)
       status(`failed: ${message}`)
       toParent({ type: 'pgmaps-engine-error', message })
@@ -829,7 +868,7 @@ function prepareFrame(now: number, fit?: { centre: THREE.Vector3; radius: number
 }
 renderer.setAnimationLoop(() => {
   // A capture has the camera and the renderer: the canvas keeps its last frame meanwhile.
-  if (capturing || gpuFailureReported) return
+  if (capturing || failure.failed) return
   const now = performance.now()
   controls.update()
   if (baking || !pacer.canSubmit(now, renderOptions)) return

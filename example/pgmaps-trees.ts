@@ -88,7 +88,8 @@ export async function standLayers(
    * Years since the fire where a stem stands on burnt ground (cover 7), else NaN: the stem is drawn as a snag
    * ({@link SNAG}, its form from `snagForm`), and left out once fallen (`standingSnagShare`).
    */
-  burntAge: (x: number, y: number) => number = () => NaN
+  burntAge: (x: number, y: number) => number = () => NaN,
+  check: () => void = () => {}
 ): Promise<{ layers: ScatterLayer[]; stems: number; snags: number; far: FarStand | null }> {
   const stride = pkg.trees.fields.length
   const data = pkg.trees.data
@@ -154,7 +155,8 @@ export async function standLayers(
     used.add(group)
     const missing = [...bins.keys()].filter((b) => !entry.bins.has(b)).sort((a, b) => a - b)
     if (missing.length) onStatus(`growing ${name} (${missing.map((b) => `${TREE_HEIGHT_LADDER[b]} m`).join(', ')})…`)
-    for (const bin of missing)
+    for (const bin of missing) {
+      check()
       entry.bins.set(
         bin,
         await buildBin(
@@ -169,6 +171,8 @@ export async function standLayers(
           rich ? shape.form : 0
         )
       )
+      check()
+    }
 
     // Classes in ladder order, each stem scaled from its class's measured size to its own.
     for (const [bin, members] of [...bins].sort((a, b) => a[0] - b[0])) {
